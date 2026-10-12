@@ -812,6 +812,7 @@ test-edge-attachments: ## [test] 校验附件构建、直链下载和 checksum �
 test-release-workflow: ## [test] 校验 GitHub Release 必须等待 CNB Edge Release 发布
 	bash scripts/test-release-workflow.sh
 	bash scripts/test-fetch-obi.sh
+	bash scripts/test-fetch-embedding-model.sh
 
 # Edge binaries are no longer package prerequisites. install.sh/upgrade.sh
 # download and verify CNB Release files before changing the Manager /edge tree.

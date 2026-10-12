@@ -4,20 +4,28 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Recover packages for an existing tag with published images'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   RELEASE_TAG_PATTERN: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   manager-image:
     name: Build manager image (${{ matrix.arch }})
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -34,12 +42,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN || "$version" != "$tag" ]]; then
             echo "VERSION ($version) must match release tag ($tag)" >&2
@@ -75,18 +85,21 @@ jobs:
 
   web-image:
     name: Publish Web multi-arch image
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN || "$version" != "$tag" ]]; then
             echo "VERSION ($version) must match release tag ($tag)" >&2
@@ -111,18 +124,21 @@ jobs:
 
   k8s-edge-image:
     name: Publish Kubernetes Edge multi-arch image
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN || "$version" != "$tag" ]]; then
             echo "VERSION ($version) must match release tag ($tag)" >&2
@@ -147,6 +163,10 @@ jobs:
 
   image:
     name: Merge release images and publish Helm chart
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (needs.manager-image.result == 'success' && needs.web-image.result == 'success' && needs.k8s-edge-image.result == 'success'))
     runs-on: ubuntu-24.04
     needs:
       - manager-image
@@ -157,12 +177,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN || "$version" != "$tag" ]]; then
             echo "VERSION ($version) must match release tag ($tag)" >&2
@@ -183,6 +205,7 @@ jobs:
           password: ${{ secrets.CNB_TOKEN }}
 
       - name: Download manager platform digests
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/download-artifact@v4
         with:
           pattern: manager-digest-*
@@ -190,6 +213,7 @@ jobs:
           merge-multiple: true
 
       - name: Merge manager multi-arch manifest
+        if: github.event_name != 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -211,6 +235,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }} package
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
     runs-on: ubuntu-24.04
     needs: image
     timeout-minutes: 180
@@ -228,6 +253,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Resolve tag
@@ -235,7 +261,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN ]]; then
             echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE], got: $tag" >&2
             exit 2
@@ -261,10 +287,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends xz-utils unzip
 
       - name: Fetch bundled embedding model
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          make fetch-embedding-model
+          # Recovery uses the repaired fetcher without changing release source.
+          git show "$WORKFLOW_SHA:dist/fetch-embedding-model.sh" > "$RUNNER_TEMP/fetch-embedding-model.sh"
+          bash "$RUNNER_TEMP/fetch-embedding-model.sh" "$PWD/.cache/embedding-models"
 
       - name: Build ${{ matrix.arch }} package
         shell: bash
@@ -294,6 +324,7 @@ jobs:
 
   edge-release:
     name: Publish versioned Edge release to CNB
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
     runs-on: ubuntu-24.04
     needs: image
     timeout-minutes: 60
@@ -301,12 +332,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Resolve tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN || "$version" != "$tag" ]]; then
             echo "VERSION ($version) must match release tag ($tag)" >&2
@@ -330,6 +363,7 @@ jobs:
 
   release:
     name: Publish release
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.edge-release.result == 'success' }}
     runs-on: ubuntu-24.04
     needs:
       - build
@@ -340,6 +374,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Resolve tag
@@ -347,7 +382,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           if [[ ! "$tag" =~ $RELEASE_TAG_PATTERN ]]; then
             echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE], got: $tag" >&2
             exit 2
