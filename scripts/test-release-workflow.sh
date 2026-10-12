@@ -10,6 +10,16 @@ command -v ruby >/dev/null 2>&1 || { echo "ruby is required" >&2; exit 1; }
 ruby -ryaml -e '
 workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
 jobs = workflow.fetch("jobs")
+events = workflow["on"] || workflow[true]
+raise "package recovery must require an existing tag" unless events.fetch("workflow_dispatch").fetch("inputs").fetch("tag").fetch("required") == true
+raise "release identity must use the requested recovery tag" unless workflow.fetch("env").fetch("RELEASE_TAG") == "${{ inputs.tag || github.ref_name }}"
+raise "recovery must share tag-push concurrency" unless workflow.fetch("concurrency").fetch("group") == "release-${{ inputs.tag || github.ref_name }}"
+jobs.each_value do |job|
+  checkout = job.fetch("steps").find { |step| step["uses"] == "actions/checkout@v6" }
+  raise "checkout must use the release tag, not the workflow branch" unless checkout.fetch("with").fetch("ref") == "${{ inputs.tag && format(\u0027refs/tags/{0}\u0027, inputs.tag) || github.ref }}"
+  resolve = job.fetch("steps").find { |step| step["name"] == "Resolve tag" }
+  raise "tag validation must use the requested release identity" unless resolve.fetch("run").include?(%q{tag="${RELEASE_TAG}"})
+end
 tag_pattern = Regexp.new(workflow.fetch("env").fetch("RELEASE_TAG_PATTERN"))
 %w[v0.14.0 v0.14.0-rc.1 v1.2.3-beta.2].each do |tag|
   raise "valid release tag rejected: #{tag}" unless tag.match?(tag_pattern)
@@ -62,11 +72,25 @@ raise "Helm publish must call its Make target" unless helm&.fetch("run")&.includ
   direct_docker = job.fetch("steps").any? { |step| step["run"]&.match?(/\bdocker buildx build\b/) }
   raise "release workflow must use Make targets instead of direct docker builds" if direct_docker
 end
+[manager, web, k8s_edge_image].each do |job|
+  raise "recovery must not overwrite published images" unless job.fetch("if") == "github.event_name != \u0027workflow_dispatch\u0027"
+end
+raise "recovery must still verify existing images" unless image.fetch("if").include?("github.event_name == \u0027workflow_dispatch\u0027")
+raise "failed image builds must block packaging" unless %w[manager-image web-image k8s-edge-image].all? { |name| image.fetch("if").include?("needs.#{name}.result == \u0027success\u0027") }
+[download, merge].each do |step|
+  raise "recovery cannot consume skipped image builds" unless step.fetch("if") == "github.event_name != \u0027workflow_dispatch\u0027"
+end
 
 edge = jobs.fetch("edge-release")
 raise "edge-release must wait for image publication" unless edge.fetch("needs") == "image"
+raise "Edge recovery must require successful image verification" unless edge.fetch("if") == "${{ !cancelled() && needs.image.result == \u0027success\u0027 }}"
 
 build = jobs.fetch("build")
+raise "package recovery must require successful image verification" unless build.fetch("if") == edge.fetch("if")
+fetch_model = build.fetch("steps").find { |step| step["name"] == "Fetch bundled embedding model" }
+raise "model fetcher must be pinned to the workflow commit" unless fetch_model.fetch("env").fetch("WORKFLOW_SHA") == "${{ github.sha }}"
+raise "recovery must load the repaired model fetcher" unless fetch_model.fetch("run").include?(%q{git show "$WORKFLOW_SHA:dist/fetch-embedding-model.sh"})
+raise "model cache must belong to the release source checkout" unless fetch_model.fetch("run").include?(%q{"$PWD/.cache/embedding-models"})
 raise "package build must wait for finalized release images" unless build.fetch("needs") == "image"
 matrix = build.fetch("strategy").fetch("matrix").fetch("include")
 arches = matrix.map { |entry| entry.fetch("arch") }.sort
@@ -91,6 +115,7 @@ raise "Edge Go toolchain must be exact for immutable binary comparison" unless g
 release_needs = Array(jobs.fetch("release").fetch("needs"))
 raise "GitHub Release must wait for Edge publication" unless release_needs.sort == ["build", "edge-release"]
 release = jobs.fetch("release")
+raise "release recovery must require both package and Edge success" unless release.fetch("if") == "${{ !cancelled() && needs.build.result == \u0027success\u0027 && needs.edge-release.result == \u0027success\u0027 }}"
 download_release = release.fetch("steps").find { |step| step["name"] == "Download package artifacts" }
 raise "release does not merge both package artifacts" unless download_release&.fetch("with")&.fetch("merge-multiple") == true
 publish_release = release.fetch("steps").find { |step| step["name"] == "Publish GitHub Release" }
