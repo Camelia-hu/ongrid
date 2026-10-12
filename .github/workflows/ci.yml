@@ -24,6 +24,18 @@ jobs:
     name: build + vet + test
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -ptest"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
 
     steps:
       - name: Checkout
@@ -78,6 +90,8 @@ jobs:
 
       - name: go test
         if: steps.changes.outputs.docs_only != 'true'
+        env:
+          ONGRID_TEST_MYSQL_DSN: root:test@tcp(127.0.0.1:3306)/?parseTime=true
         run: go test -race ./...
 
       - name: Kubernetes JVM attach capabilities

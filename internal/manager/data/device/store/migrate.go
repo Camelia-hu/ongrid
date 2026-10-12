@@ -71,16 +71,28 @@ func Migrate(db *gorm.DB) error {
 }
 
 // refreshDeviceRolesConstraint reapplies the current model constraint for
-// existing SQLite databases. GORM creates CHECK constraints for new tables,
+// existing databases. GORM creates CHECK constraints for new tables,
 // but does not alter an existing constraint when the allowed role bits grow.
-// Production MySQL installations use the versioned SQL migration under
-// db/migrations; this keeps local SQLite upgrades on the same contract.
 func refreshDeviceRolesConstraint(db *gorm.DB) error {
-	if db.Dialector.Name() != "sqlite" {
+	if db.Dialector.Name() != "sqlite" && db.Dialector.Name() != "mysql" {
 		return nil
 	}
 	const constraintName = "chk_devices_roles"
 	if !db.Migrator().HasConstraint(&model.Device{}, constraintName) {
+		return nil
+	}
+	if db.Dialector.Name() == "mysql" {
+		var clause string
+		if err := db.Raw("SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = ?", constraintName).Scan(&clause).Error; err != nil {
+			return fmt.Errorf("inspect device roles constraint: %w", err)
+		}
+		if strings.Contains(strings.ToUpper(strings.ReplaceAll(clause, "`", "")), "ROLES BETWEEN 0 AND 31") {
+			return nil
+		}
+		// Replace atomically so a failed ALTER keeps the existing constraint.
+		if err := db.Exec("ALTER TABLE devices DROP CHECK chk_devices_roles, ADD CONSTRAINT chk_devices_roles CHECK (roles BETWEEN 0 AND 31)").Error; err != nil {
+			return fmt.Errorf("update device roles constraint: %w", err)
+		}
 		return nil
 	}
 	var createSQL string
