@@ -231,9 +231,13 @@ function StreamStateBadge({ health }: { health?: IMStreamHealth }) {
       );
     case 'retrying': {
       const reason = health.last_error || tr('正在重连', 'Reconnecting');
+      // Hint renders its trigger *as* the child, so the child must forward a
+      // ref: Chip is a plain function component, hence the span wrapper.
       return (
         <Hint content={reason}>
-          <Chip tone="warning">{tr('重连中', 'Retrying')}</Chip>
+          <span className="inline-flex">
+            <Chip tone="warning">{tr('重连中', 'Retrying')}</Chip>
+          </span>
         </Hint>
       );
     }
