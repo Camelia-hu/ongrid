@@ -10,8 +10,8 @@ import (
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/glebarez/sqlite"
-	runtime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
-	"github.com/ongridio/ongrid/internal/manager/biz/aiops/graph"
+	runtime "github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/v3/chatruntime"
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/v3/graph"
 	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
 	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	"github.com/ongridio/ongrid/internal/manager/biz/approval"
@@ -75,7 +75,7 @@ func TestMCPApprovalRuntimeResumesWithResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	uc := approval.NewUsecase(approvalstore.NewRepo(db), nil)
-	uc.RegisterExecutor("mcp_call", func(context.Context, string) (string, error) { return `{"clusters":["test"]}`, nil })
+	uc.RegisterRuntimeExecutor("mcp_call", "v3", func(context.Context, string) (string, error) { return `{"clusters":["test"]}`, nil })
 	repo := chatstore.NewSessionRepoWithAttachmentRoot(db, t.TempDir())
 	sess := &chatmodel.Session{ID: "session-445", UserID: 7}
 	if err := repo.CreateSession(context.Background(), sess); err != nil {

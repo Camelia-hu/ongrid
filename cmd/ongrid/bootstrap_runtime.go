@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"time"
 
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
+	einocallbacks "github.com/cloudwego/eino/callbacks"
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/contract"
+	v2 "github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/v2/chatruntime"
+	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/v3/chatruntime"
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
 	aiopstoolsbase "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	aiopstoolsdec "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/decorators"
@@ -18,14 +21,24 @@ import (
 type runtimeModule struct {
 	bootstrapSkillReg   *aiopschatruntime.SkillRegistry
 	bootstrapAgentReg   *aiopschatruntime.AgentRegistry
-	aiopsRuntime        managersvcaiops.RuntimeHandler
+	aiopsRuntime        *managersvcaiops.RuntimeRouter
 	chatRT              *aiopschatruntime.Runtime
+	chatV2              *v2.Runtime
+	bootstrapV2SkillReg *v2.SkillRegistry
+	bootstrapV2AgentReg *v2.AgentRegistry
 	humanApprovalBroker *managersvcaiops.HumanApprovalBroker
 	aiopsSvc            *managersvcaiops.Service
 	aiopsHandler        *managerserveraiops.Handler
 }
 
-func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Logger, reg *prometheus.Registry, tracing *tracingModule, models *modelsModule, devices *devicesModule, telemetry *telemetryModule, tunnel *tunnelModule, aiops *aiopsModule) *runtimeModule {
+func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Logger, reg *prometheus.Registry, tracing *tracingModule, models *modelsModule, devices *devicesModule, telemetry *telemetryModule, tunnel *tunnelModule, aiops *aiopsModule, settings *settingsModule) *runtimeModule {
+	// 在创建任何新 Worker 前收尾上一进程的内部会话，避免重启后永久显示运行中。
+	if n, err := aiops.aiopsRepo.ReconcileInterruptedWorkers(rootCtx, time.Now().UTC()); err != nil {
+		log.Error("interrupted worker recovery failed", slog.Any("err", err))
+	} else if n > 0 {
+		log.Info("interrupted workers closed on startup", slog.Int64("sessions", n))
+	}
+
 	// AgentRegistry + SkillRegistry are loaded UNCONDITIONALLY from
 	// ./agents + configured skill roots + the marketplace root. These are
 	// YAML+markdown metadata, so the /v1/agents
@@ -38,23 +51,43 @@ func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Log
 	// building its own; the chat coordinator + worker dispatch references
 	// the same in-memory instances we hand to aiopsHandler below.
 	bootstrapSkillReg, bootstrapAgentReg := loadBootstrapRegistries(log)
+	v2Skills, v2Agents := loadV2BootstrapRegistries(log)
+	var chatV2 *v2.Runtime
 
 	var (
-		aiopsRuntime managersvcaiops.RuntimeHandler
-		// chatRT keeps the concrete runtime handle so the ADR-026
-		// self-obs sampler ticker (eg.Go in the goroutine wiring below)
-		// can call CountWorkersByStatus. The interface-typed
-		// aiopsRuntime is what the chat service consumes.
+		aiopsRuntime *managersvcaiops.RuntimeRouter
+		// chatRT owns version-local catalog, persona and credential assembly.
+		// All external execution and worker metrics use aiopsRuntime.
 		chatRT *aiopschatruntime.Runtime
 	)
 	humanApprovalBroker := managersvcaiops.NewHumanApprovalBroker()
-	if aiops.kernel == managersvcaiops.KernelGraph {
+	{
 		rt, rterr := buildAIOpsRuntime(rootCtx, cfg, models.llmClient, models.llmRouter, aiops.toolsReg, aiops.aiopsRepo, aiops.mutatingProposalRepo, tunnel.fbClient, devices.edgeUC, devices.deviceUC, reg, log, bootstrapSkillReg, bootstrapAgentReg, models.llmSettingsResolver, humanApprovalBroker, tracing.agentTraceCallback)
 		if rterr != nil {
-			log.Warn("aiops runtime build failed — falling back to legacy kernel", slog.Any("err", rterr))
-			aiops.kernel = managersvcaiops.KernelLegacy
+			log.Error("aiops runtime unavailable", slog.Any("err", rterr))
 		} else {
-			aiopsRuntime = rt
+			var v2Trace einocallbacks.Handler
+			if tracing.agentTraceCallback != nil {
+				v2Trace = tracing.agentTraceCallback
+			}
+			v2rt, err := buildV2AIOpsRuntime(rootCtx, cfg, models.llmClient, models.llmRouter, aiops.toolsReg, aiops.aiopsRepo, aiops.mutatingProposalRepo, tunnel.fbClient, devices.edgeUC, devices.deviceUC, reg, log, v2Skills, v2Agents, models.llmSettingsResolver, humanApprovalBroker, v2Trace)
+			engines := map[contract.Version]managersvcaiops.RuntimeEngine{contract.V3: rt}
+			if err != nil {
+				log.Error("v2 runtime unavailable", slog.Any("err", err))
+			} else {
+				chatV2 = v2rt
+				engines[contract.V2] = managersvcaiops.V2Runtime{Runtime: v2rt}
+			}
+			router, err := managersvcaiops.NewRuntimeRouter(aiops.aiopsRepo, contract.V3, engines,
+				managersvcaiops.WithRuntimeDefaultProvider(func(ctx context.Context) (contract.Version, error) {
+					version, err := settings.settingSvc.AgentRuntimeVersion(ctx)
+					return contract.Version(version), err
+				}))
+			if err != nil {
+				log.Error("aiops runtime routing unavailable", slog.Any("err", err))
+			} else {
+				aiopsRuntime = router
+			}
 			chatRT = rt
 			// — wire the coordinator-only AgentTool /
 			// SendMessage / TaskStop trio. Two-step because of the
@@ -69,18 +102,12 @@ func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Log
 			// unconditionally via coordinatorOnlyTools (see
 			// chatruntime/worker.go).
 			aiops.toolsReg.SetWorkerSpawner(
-				managersvcaiops.WorkerSpawner{Runtime: rt},
+				managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime},
 				managersvcaiops.AgentRegistry{Inner: rt.AgentRegistry()},
 			)
-			// SendMessage / TaskStop are control-plane micro-ops; 15s
-			// is plenty. AgentTool is the odd one out: synchronous
-			// dispatch blocks until the worker LLM finishes its full
-			// ReAct loop, which can legitimately take 60-120s on
-			// non-trivial diagnoses. Use a separate deps with a much
-			// larger timeout so AgentTool isn't killed mid-worker —
-			// without this, every dispatch returns "tool timed out
-			// after 15s" and the coordinator loops trying to
-			// re-dispatch.
+			// SendMessage / TaskStop follow caller cancellation without an added
+			// blanket deadline. Synchronous AgentTool dispatch waits for the full
+			// worker loop, so it retains its explicit 180s operation budget.
 			coordDepsFast := aiopstoolsdec.Deps{
 				Limiter:       aiopstoolsdec.NewTokenBucketLimiter(0),
 				Registerer:    reg,
@@ -93,11 +120,23 @@ func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Log
 				HumanApproval: humanApprovalBroker,
 			}
 			wrappedCoord := []aiopstoolsbase.BaseTool{
-				aiopstoolsdec.Wrap(aiopstools.NewAgentTool(managersvcaiops.WorkerSpawner{Runtime: rt}, managersvcaiops.AgentRegistry{Inner: rt.AgentRegistry()}, log), coordDepsDispatch),
-				aiopstoolsdec.Wrap(aiopstools.NewSendMessageTool(managersvcaiops.WorkerSpawner{Runtime: rt}, log), coordDepsFast),
-				aiopstoolsdec.Wrap(aiopstools.NewTaskStopTool(managersvcaiops.WorkerSpawner{Runtime: rt}, log), coordDepsFast),
+				aiopstoolsdec.Wrap(aiopstools.NewAgentTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, managersvcaiops.AgentRegistry{Inner: rt.AgentRegistry()}, log), coordDepsDispatch),
+				aiopstoolsdec.Wrap(aiopstools.NewSendMessageTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, log), coordDepsFast),
+				aiopstoolsdec.Wrap(aiopstools.NewTaskStopTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, log), coordDepsFast),
 			}
-			rt.AppendToolBag(wrappedCoord)
+			if err := rt.AppendToolBag(wrappedCoord); err != nil {
+				log.Error("append coordinator tools failed", slog.Any("err", err))
+			}
+			if chatV2 != nil {
+				v2Coord := []aiopstoolsbase.BaseTool{
+					aiopstoolsdec.Wrap(aiopstools.NewAgentTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, managersvcaiops.V2AgentRegistry{Inner: chatV2.AgentRegistry()}, log), coordDepsDispatch),
+					aiopstoolsdec.Wrap(aiopstools.NewSendMessageTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, log), coordDepsFast),
+					aiopstoolsdec.Wrap(aiopstools.NewTaskStopTool(managersvcaiops.WorkerSpawner{Runtime: aiopsRuntime}, log), coordDepsFast),
+				}
+				if err := chatV2.AppendToolBag(v2Coord); err != nil {
+					log.Error("append v2 coordinator tools failed", slog.Any("err", err))
+				}
+			}
 			log.Info("aiops runtime wired",
 				slog.Int("tool_count", rt.ToolCount()),
 				slog.Any("tool_names", rt.ToolNames(rootCtx)),
@@ -105,7 +144,7 @@ func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Log
 		}
 	}
 
-	aiopsSvc := managersvcaiops.NewWithKernel(aiops.aiopsAgent, aiopsRuntime, aiops.kernel, aiops.aiopsRepo, aiops.aiopsUsage, log)
+	aiopsSvc := managersvcaiops.New(aiopsRuntime, aiops.aiopsRepo, aiops.aiopsUsage, log)
 	aiopsSvc.SetMutatingProposalRepo(aiops.mutatingProposalRepo)
 	aiopsSvc.WithAPMSourceResolver(telemetry.apmService)
 	aiopsSvc.SetAttachmentRepo(aiops.aiopsRepo)
@@ -118,6 +157,9 @@ func bootstrapRuntime(rootCtx context.Context, cfg *config.Config, log *slog.Log
 		bootstrapAgentReg:   bootstrapAgentReg,
 		aiopsRuntime:        aiopsRuntime,
 		chatRT:              chatRT,
+		chatV2:              chatV2,
+		bootstrapV2SkillReg: v2Skills,
+		bootstrapV2AgentReg: v2Agents,
 		humanApprovalBroker: humanApprovalBroker,
 		aiopsSvc:            aiopsSvc,
 		aiopsHandler:        aiopsHandler,

@@ -3,6 +3,7 @@ package flow
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
@@ -18,7 +19,7 @@ func (tool lateTool) Info(context.Context) (*basetool.ToolInfo, error) {
 }
 
 func (lateTool) InvokableRun(ctx context.Context, args string, _ ...basetool.InvokeOption) (string, error) {
-	return `{"source":"` + basetool.ArtifactSourceFromContext(ctx) + `","args":` + args + `}`, nil
+	return `{"web_allowed":` + strconv.FormatBool(basetool.WebSearchAllowed(ctx)) + `,"source":"` + basetool.ArtifactSourceFromContext(ctx) + `","args":` + args + `}`, nil
 }
 
 func TestToolInvokerMergesLateToolsOnceAndPreservesWorkflowContext(t *testing.T) {
@@ -40,13 +41,14 @@ func TestToolInvokerMergesLateToolsOnceAndPreservesWorkflowContext(t *testing.T)
 		t.Fatal(err)
 	}
 	var result struct {
-		Source string          `json:"source"`
-		Args   json.RawMessage `json:"args"`
+		WebAllowed bool            `json:"web_allowed"`
+		Source     string          `json:"source"`
+		Args       json.RawMessage `json:"args"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Source != "workflow" || string(result.Args) != "{}" {
+	if !result.WebAllowed || result.Source != "workflow" || string(result.Args) != "{}" {
 		t.Fatalf("tool result = %s", out)
 	}
 	if _, err := invoker.InvokeTool(context.Background(), aiopstools.ToolNameExecuteK8sAction, nil); err == nil {

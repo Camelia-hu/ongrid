@@ -3,49 +3,21 @@ package aiops
 import (
 	"context"
 	"fmt"
-	"sync"
-
-	aiopsagent "github.com/ongridio/ongrid/internal/manager/biz/aiops/agent"
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
 	managerbizaiopsmentions "github.com/ongridio/ongrid/internal/manager/biz/aiops/mentions"
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/contract"
+	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/v3/chatruntime"
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
 	aiopstoolsdec "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/decorators"
 	"github.com/ongridio/ongrid/internal/pkg/llm"
+	"sync"
 )
 
-// MentionResolver shuttles between agent.Mention (the type
-// agent.go uses internally to keep its dependency surface narrow) and
-// mentions.Mention (the biz layer's type). One copy on each Run is
-// negligible; the alternative — leaking biz/aiops/mentions into the
-// agent package — would invert the dep direction.
-type MentionResolver struct {
-	Inner *managerbizaiopsmentions.Searcher
-}
-
-func (a MentionResolver) Resolve(ctx context.Context, in []aiopsagent.Mention) []string {
-	if a.Inner == nil || len(in) == 0 {
-		return nil
-	}
-	out := make([]managerbizaiopsmentions.Mention, 0, len(in))
-	for _, m := range in {
-		out = append(out, managerbizaiopsmentions.Mention{
-			Type:  managerbizaiopsmentions.Type(m.Type),
-			ID:    m.ID,
-			Label: m.Label,
-		})
-	}
-	return a.Inner.Resolve(ctx, out)
-}
-
-// ChatMentionResolver is the same translation as
-// MentionResolver but for the chatruntime.Mention shape (the
-// new graph kernel's local type — kept separate from agent.Mention so
-// chatruntime doesn't import agent).
+// ChatMentionResolver adapts resource mentions for the unified runtime.
 type ChatMentionResolver struct {
 	Inner *managerbizaiopsmentions.Searcher
 }
 
-func (a ChatMentionResolver) Resolve(ctx context.Context, in []aiopschatruntime.Mention) []string {
+func (a ChatMentionResolver) Resolve(ctx context.Context, in []contract.Mention) []string {
 	if a.Inner == nil || len(in) == 0 {
 		return nil
 	}
@@ -72,16 +44,16 @@ func (a ChatMentionResolver) Resolve(ctx context.Context, in []aiopschatruntime.
 // emitter from ctx so a background worker's task_notification frame
 // lands on the user's SSE channel.
 type WorkerSpawner struct {
-	Runtime *aiopschatruntime.Runtime
+	Runtime WorkerRuntime
 }
 
 func (s WorkerSpawner) SpawnWorker(ctx context.Context, req aiopstools.SpawnWorkerRequest) (*aiopstools.WorkerHandle, error) {
-	w, err := s.Runtime.SpawnWorker(ctx, aiopschatruntime.SpawnRequest{
+	w, err := s.Runtime.SpawnWorker(ctx, contract.SpawnRequest{
 		AgentName:     req.AgentName,
 		Prompt:        req.Prompt,
 		Background:    req.Background,
 		ParentSession: req.ParentSession,
-		ParentEmit:    aiopschatruntime.EmitFromContext(ctx),
+		ParentEmit:    contract.EmitFromContext(ctx),
 		Locale:        req.Locale,
 		Provider:      req.Provider,
 		Model:         req.Model,
@@ -113,10 +85,10 @@ func (s WorkerSpawner) GetWorker(workerID string) (*aiopstools.WorkerHandle, boo
 // NewRuntime returns; until then mutating tools fail closed.
 type ReviewSpawner struct {
 	mu sync.RWMutex
-	rt *aiopschatruntime.Runtime
+	rt WorkerRuntime
 }
 
-func (s *ReviewSpawner) SetRuntime(rt *aiopschatruntime.Runtime) {
+func (s *ReviewSpawner) SetRuntime(rt WorkerRuntime) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rt = rt
@@ -129,11 +101,11 @@ func (s *ReviewSpawner) SpawnReviewer(ctx context.Context, req aiopstoolsdec.Rev
 	if rt == nil {
 		return nil, fmt.Errorf("reviewer runtime not wired")
 	}
-	w, err := rt.SpawnWorker(ctx, aiopschatruntime.SpawnRequest{
+	w, err := rt.SpawnWorker(ctx, contract.SpawnRequest{
 		AgentName:  req.AgentName,
 		Prompt:     req.Prompt,
 		Background: false,
-		ParentEmit: aiopschatruntime.EmitFromContext(ctx),
+		ParentEmit: contract.EmitFromContext(ctx),
 	})
 	if err != nil {
 		return nil, err
@@ -148,7 +120,7 @@ func (s *ReviewSpawner) SpawnReviewer(ctx context.Context, req aiopstoolsdec.Rev
 // workerToHandle copies the chatruntime.Worker fields the tools layer
 // cares about into the seam-side shape. Duration is computed from
 // StartedAt + EndedAt when both are set; zero otherwise.
-func workerToHandle(w *aiopschatruntime.Worker) *aiopstools.WorkerHandle {
+func workerToHandle(w *contract.Worker) *aiopstools.WorkerHandle {
 	if w == nil {
 		return nil
 	}

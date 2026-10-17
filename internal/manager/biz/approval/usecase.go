@@ -9,9 +9,11 @@ package approval
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	model "github.com/ongridio/ongrid/internal/manager/model/approval"
@@ -31,15 +33,18 @@ type Repo interface {
 
 // Executor runs an approved action's payload and returns a result blob.
 // Registered per Kind by the producer (e.g. cloud-shell registers
-// "shell_command"). Absent executor → Approve just marks the row approved
-// (no execution), which is safe.
+// "shell_command"). Missing executors fail the action explicitly; historical
+// approval records never imply that an unavailable action was executed.
 type Executor func(ctx context.Context, payloadJSON string) (resultJSON string, err error)
+
+type executorKey struct{ kind, runtimeVersion string }
 
 // Usecase is the inbox facade.
 type Usecase struct {
-	repo      Repo
-	log       *slog.Logger
-	executors map[string]Executor
+	executorMu sync.RWMutex
+	repo       Repo
+	log        *slog.Logger
+	executors  map[executorKey]Executor
 }
 
 // NewUsecase wires the repo.
@@ -47,24 +52,33 @@ func NewUsecase(repo Repo, log *slog.Logger) *Usecase {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Usecase{repo: repo, log: log, executors: map[string]Executor{}}
+	return &Usecase{repo: repo, log: log, executors: map[executorKey]Executor{}}
 }
 
 // RegisterExecutor wires the execute-on-approve handler for a Kind. Called
 // at boot by the producer subsystem (e.g. cloud-shell). Idempotent.
 func (u *Usecase) RegisterExecutor(kind string, fn Executor) {
-	u.executors[kind] = fn
+	u.RegisterRuntimeExecutor(kind, "", fn)
+}
+
+// RegisterRuntimeExecutor registers an exact (kind, runtime) execution route.
+// Versioned proposals never fall back to an unversioned or newer executor.
+func (u *Usecase) RegisterRuntimeExecutor(kind, runtimeVersion string, fn Executor) {
+	u.executorMu.Lock()
+	defer u.executorMu.Unlock()
+	u.executors[executorKey{kind: kind, runtimeVersion: runtimeVersion}] = fn
 }
 
 // ProposeInput is what a producer queues.
 type ProposeInput struct {
-	Kind       string
-	Title      string
-	Summary    string
-	Payload    any    // marshaled to PayloadJSON
-	Source     string // SourceAgent / SourceFlow
-	SessionID  string
-	ProposedBy uint64
+	RuntimeVersion string
+	Kind           string
+	Title          string
+	Summary        string
+	Payload        any    // marshaled to PayloadJSON
+	Source         string // SourceAgent / SourceFlow
+	SessionID      string
+	ProposedBy     uint64
 }
 
 // Propose records a pending action. Producer-facing (not admin-gated — the
@@ -72,6 +86,9 @@ type ProposeInput struct {
 func (u *Usecase) Propose(ctx context.Context, in ProposeInput) (*model.Approval, error) {
 	if strings.TrimSpace(in.Kind) == "" || strings.TrimSpace(in.Title) == "" {
 		return nil, fmt.Errorf("%w: kind + title required", errs.ErrInvalid)
+	}
+	if len(in.RuntimeVersion) > 16 {
+		return nil, fmt.Errorf("%w: runtime version too long", errs.ErrInvalid)
 	}
 	payload, err := json.Marshal(in.Payload)
 	if err != nil {
@@ -82,7 +99,8 @@ func (u *Usecase) Propose(ctx context.Context, in ProposeInput) (*model.Approval
 		src = model.SourceAgent
 	}
 	a := &model.Approval{
-		Kind: in.Kind, Title: in.Title, Summary: in.Summary,
+		RuntimeVersion: in.RuntimeVersion,
+		Kind:           in.Kind, Title: in.Title, Summary: in.Summary,
 		PayloadJSON: string(payload), Source: src, SessionID: in.SessionID,
 		Status: model.StatusPending, ProposedBy: in.ProposedBy,
 	}
@@ -119,21 +137,34 @@ func (u *Usecase) Approve(ctx context.Context, approverID uint64, id string) (*m
 	if err != nil {
 		return nil, err
 	}
-	exec, ok := u.executors[a.Kind]
-	if !ok {
-		u.log.Warn("approved but no executor for kind", slog.String("id", id), slog.String("kind", a.Kind))
-		return a, nil
+	u.executorMu.RLock()
+	exec := u.executors[executorKey{kind: a.Kind, runtimeVersion: a.RuntimeVersion}]
+	u.executorMu.RUnlock()
+	var res string
+	var runErr error
+	if exec == nil {
+		runErr = fmt.Errorf("approval executor for %q runtime %q is unavailable; submit a new request", a.Kind, a.RuntimeVersion)
+	} else {
+		res, runErr = exec(ctx, a.PayloadJSON)
 	}
-	res, runErr := exec(ctx, a.PayloadJSON)
 	status := model.StatusExecuted
 	if runErr != nil {
 		status = model.StatusFailed
-		res = fmt.Sprintf(`{"error":%q}`, runErr.Error())
+		payload, err := json.Marshal(struct {
+			Error string `json:"error"`
+		}{Error: runErr.Error()})
+		if err != nil {
+			return nil, fmt.Errorf("encode approval failure: %w", err)
+		}
+		res = string(payload)
 	}
 	if err := u.repo.SetResult(ctx, id, status, res, time.Now().UTC()); err != nil {
-		u.log.Warn("set approval result failed", slog.String("id", id), slog.Any("err", err))
+		return nil, fmt.Errorf("persist approval execution result: %w", err)
 	}
-	a, _ = u.repo.Get(ctx, id)
+	a, err = u.repo.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("read completed approval: %w", err)
+	}
 	return a, nil
 }
 
@@ -144,4 +175,29 @@ func (u *Usecase) Reject(ctx context.Context, approverID uint64, id, reason stri
 		"status": model.StatusRejected, "approved_by": approverID,
 		"reason": strings.TrimSpace(reason), "decided_at": now,
 	})
+}
+
+// InvalidatePending retires a proposal whose originating request can no longer
+// execute. The conditional decision never overwrites approval or rejection.
+func (u *Usecase) InvalidatePending(ctx context.Context, id, reason string) error {
+	result, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: reason})
+	if err != nil {
+		return fmt.Errorf("encode invalidated approval: %w", err)
+	}
+	err = u.repo.Decide(ctx, id, map[string]any{"status": model.StatusFailed, "reason": reason, "result_json": string(result), "decided_at": time.Now().UTC()})
+	if errors.Is(err, errs.ErrNotFound) {
+		row, readErr := u.repo.Get(ctx, id)
+		if readErr != nil {
+			return fmt.Errorf("read invalidated approval: %w", readErr)
+		}
+		if row.Status != model.StatusPending {
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("invalidate pending approval: %w", err)
+	}
+	return nil
 }

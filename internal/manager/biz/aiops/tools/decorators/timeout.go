@@ -32,8 +32,8 @@ type TimeoutTool struct {
 }
 
 // WithTimeout returns inner wrapped so InvokableRun is bounded by d.
-// Zero or negative d adds no deadline: inner is returned
-// unchanged and only the caller context bounds the call.
+// Zero or negative d adds no deadline; the caller and tool retain ownership
+// of cancellation and operation-specific budgets.
 func WithTimeout(inner basetool.BaseTool, d time.Duration) basetool.BaseTool {
 	if d <= 0 {
 		return inner

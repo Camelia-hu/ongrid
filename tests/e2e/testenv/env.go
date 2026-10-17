@@ -149,6 +149,7 @@ func Start(t *testing.T, opts ...Option) *Env {
 		"ONGRID_ADMIN_PASSWORD":      env.AdminPassword,
 		"ONGRID_PUBLIC_URL":          env.httpBase,
 		"ONGRID_PAGES_DIR":           pagesDir,
+		"ONGRID_CHAT_ATTACHMENT_DIR": t.TempDir(),
 		"ONGRID_PROM_ENABLED":        "true",
 		"ONGRID_PROM_URL":            env.prom.URL(),
 		"ONGRID_PROM_QUERY_URL":      env.prom.URL(),
@@ -164,11 +165,6 @@ func Start(t *testing.T, opts ...Option) *Env {
 		"ONGRID_ZHIPU_BASE_URL":      env.llm.URL() + "/v1",
 		"ONGRID_ZHIPU_MODEL":         "glm-fake",
 		"ONGRID_ALERT_EVAL_INTERVAL": "30s",
-		// Graph kernel is the live runtime (memory: chat quality
-		// 2026-05-25). The legacy kernel doesn't build chatruntime, so
-		// investigator / agent paths look "not wired". Default the
-		// harness to the same kernel production runs on.
-		"ONGRID_AGENT_KERNEL": "graph",
 		// Tell the chatruntime loader where to find the agent markdown.
 		// The manager binary is spawned in a tempdir so the default
 		// `./agents` path doesn't resolve to the repo. Without this,

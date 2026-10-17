@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	managersvcimbridge "github.com/ongridio/ongrid/internal/manager/service/imbridge"
 	"log/slog"
 
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
 	managerbizaiopsmentions "github.com/ongridio/ongrid/internal/manager/biz/aiops/mentions"
 	managerbizimbridge "github.com/ongridio/ongrid/internal/manager/biz/imbridge"
 	managerbizimbridgedingtalk "github.com/ongridio/ongrid/internal/manager/biz/imbridge/provider/dingtalk"
@@ -29,7 +29,7 @@ func bootstrapIMBridge(rootCtx context.Context, log *slog.Logger, storage *stora
 	// Service-account user_id: superuser admin (id=1 on every install
 	// thanks to bootstrap). Future: take from cfg.
 	const imBridgeServiceUserID uint64 = 1
-	imbridgeAgentAdapter := managerbizimbridge.NewAiopsAdapter(runtime.aiopsSvc, imBridgeServiceUserID, models.llmSettingsResolver, log)
+	imbridgeAgentAdapter := managersvcimbridge.NewAiopsAdapter(runtime.aiopsSvc, imBridgeServiceUserID, models.llmSettingsResolver, log)
 	imbridgeSvc := managerbizimbridge.NewBridge(aiops.imbridgeRepo, imbridgeAgentAdapter, imBridgeServiceUserID, log)
 	imbridgeHandler := managerserverimbridge.NewHandler(imbridgeSvc, aiops.imbridgeRepo, aiops.imbridgeUC, log)
 
@@ -93,11 +93,13 @@ func bootstrapIMBridge(rootCtx context.Context, log *slog.Logger, storage *stora
 	// into the user message prelude on each Run. The agent uses its
 	// own Mention type to keep the agent package dep-light; an adapter
 	// shuttles between the two shapes here at the wiring site.
-	aiops.aiopsAgent.SetMentionResolver(managersvcaiops.MentionResolver{Inner: mentionSearcher})
 	// Mirror the same wiring on the new graph kernel runtime when it
 	// was successfully constructed. Same searcher, two adapter shapes
 	// — see the type definitions at the bottom of this file.
-	if rt, ok := runtime.aiopsRuntime.(*aiopschatruntime.Runtime); ok && rt != nil {
+	if rt := runtime.chatRT; rt != nil {
+		rt.SetMentionResolver(managersvcaiops.ChatMentionResolver{Inner: mentionSearcher})
+	}
+	if rt := runtime.chatV2; rt != nil {
 		rt.SetMentionResolver(managersvcaiops.ChatMentionResolver{Inner: mentionSearcher})
 	}
 

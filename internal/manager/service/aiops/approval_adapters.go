@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	aiopsagent "github.com/ongridio/ongrid/internal/manager/biz/aiops/agent"
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
+	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/contract"
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	managerbizapproval "github.com/ongridio/ongrid/internal/manager/biz/approval"
 	managerbizmcp "github.com/ongridio/ongrid/internal/manager/biz/mcp"
 	managerbizsecret "github.com/ongridio/ongrid/internal/manager/biz/secret"
@@ -22,9 +22,11 @@ import (
 // TYPE inject rule into env vars at approve time. Credential (singular) is a
 // legacy field kept so an in-flight pre-upgrade approval still resolves.
 type cloudBashPayload struct {
-	Command     string   `json:"command"`
-	Credentials []string `json:"credentials,omitempty"`
-	Credential  string   `json:"credential,omitempty"` // legacy single
+	SkillAssets      []basetool.SkillAssetRef `json:"skill_assets,omitempty"`
+	SkillCredentials []string                 `json:"skill_credentials,omitempty"`
+	Command          string                   `json:"command"`
+	Credentials      []string                 `json:"credentials,omitempty"`
+	Credential       string                   `json:"credential,omitempty"` // legacy single
 	// SessionID is the chat session that proposed the command (HLD-019). The
 	// executor maps it to a persistent per-session working directory so files
 	// a tool writes in one command survive to the next, instead of running in
@@ -137,13 +139,14 @@ func (s CloudBashProposer) ProposeAndAwait(ctx context.Context, command string, 
 		title = title[:100] + "…"
 	}
 	a, err := s.Usecase.Propose(ctx, managerbizapproval.ProposeInput{
-		Kind:       "cloud_bash",
-		Title:      title,
-		Summary:    strings.Join(credentials, ", "), // plain names; card shows them
-		Payload:    cloudBashPayload{Command: command, Credentials: credentials, SessionID: sessionID},
-		Source:     "agent",
-		SessionID:  sessionID,
-		ProposedBy: userID,
+		RuntimeVersion: string(aiopschatruntime.VersionFromContext(ctx)),
+		Kind:           "cloud_bash",
+		Title:          title,
+		Summary:        strings.Join(credentials, ", "), // plain names; card shows them
+		Payload:        cloudBashPayload{SkillCredentials: basetool.BoundCredentialsFromContext(ctx), SkillAssets: basetool.SkillAssetsFromContext(ctx), Command: command, Credentials: credentials, SessionID: sessionID},
+		Source:         "agent",
+		SessionID:      sessionID,
+		ProposedBy:     userID,
 	})
 	if err != nil {
 		return "", err
@@ -181,13 +184,14 @@ func (s HostBashProposer) ProposeAndAwait(ctx context.Context, deviceIDs []uint6
 		title = title[:100] + "…"
 	}
 	a, err := s.Usecase.Propose(ctx, managerbizapproval.ProposeInput{
-		Kind:       "host_bash",
-		Title:      title,
-		Summary:    fmt.Sprintf("device_ids=%v", deviceIDs),
-		Payload:    hostBashPayload{DeviceIDs: deviceIDs, Command: command, TimeoutSeconds: timeoutSeconds},
-		Source:     "agent",
-		SessionID:  sessionID,
-		ProposedBy: userID,
+		RuntimeVersion: string(aiopschatruntime.VersionFromContext(ctx)),
+		Kind:           "host_bash",
+		Title:          title,
+		Summary:        fmt.Sprintf("device_ids=%v", deviceIDs),
+		Payload:        hostBashPayload{DeviceIDs: deviceIDs, Command: command, TimeoutSeconds: timeoutSeconds},
+		Source:         "agent",
+		SessionID:      sessionID,
+		ProposedBy:     userID,
 	})
 	if err != nil {
 		return "", err
@@ -207,87 +211,6 @@ func (s HostBashProposer) ProposeAndAwait(ctx context.Context, deviceIDs []uint6
 	return CloudBashProposer{Usecase: s.Usecase}.awaitDecision(ctx, a.ID)
 }
 
-// K8sActionProposer gives the default legacy kernel the same synchronous
-// propose-confirm UX used by host_bash. The tool has already consumed a
-// matching dry-run token before this method is called; no Kubernetes write is
-// dispatched until the approval executor runs.
-type K8sActionProposer struct{ Usecase *managerbizapproval.Usecase }
-
-func (s K8sActionProposer) ProposeAndAwait(ctx context.Context, args aiopstools.ExecuteK8sActionArgs, sessionID, toolCallID string, userID uint64) (string, error) {
-	command := formatK8sActionApproval(args)
-	title := aiopstools.ToolNameExecuteK8sAction + " " + command
-	if len(title) > 120 {
-		title = title[:120] + "…"
-	}
-	summary := command
-	if reason := strings.TrimSpace(args.Reason); reason != "" {
-		summary += " reason=" + reason
-	}
-	a, err := s.Usecase.Propose(ctx, managerbizapproval.ProposeInput{
-		Kind:       aiopstools.ToolNameExecuteK8sAction,
-		Title:      title,
-		Summary:    summary,
-		Payload:    K8sActionPayload{Args: args, UserID: userID, SessionID: sessionID},
-		Source:     "agent",
-		SessionID:  sessionID,
-		ProposedBy: userID,
-	})
-	if err != nil {
-		return "", err
-	}
-	if emit := aiopschatruntime.EmitFromContext(ctx); emit != nil {
-		emit(aiopschatruntime.Event{
-			Type: aiopschatruntime.EventApprovalPending,
-			Approval: &aiopschatruntime.ApprovalPending{
-				ApprovalID: a.ID,
-				ToolCallID: toolCallID,
-				Kind:       aiopstools.ToolNameExecuteK8sAction,
-				ToolName:   aiopstools.ToolNameExecuteK8sAction,
-				Command:    command,
-			},
-		})
-	} else if emit := aiopsagent.EmitFromContext(ctx); emit != nil {
-		emit(aiopsagent.Event{
-			Type: aiopsagent.EventApprovalPending,
-			Approval: &aiopsagent.ApprovalPendingEvent{
-				ApprovalID: a.ID,
-				ToolCallID: toolCallID,
-				Kind:       aiopstools.ToolNameExecuteK8sAction,
-				ToolName:   aiopstools.ToolNameExecuteK8sAction,
-				Command:    command,
-			},
-		})
-	}
-	return CloudBashProposer{Usecase: s.Usecase}.awaitDecision(ctx, a.ID)
-}
-
-func formatK8sActionApproval(args aiopstools.ExecuteK8sActionArgs) string {
-	target := strings.TrimSpace(args.Name)
-	if namespace := strings.TrimSpace(args.Namespace); namespace != "" {
-		target = namespace + "/" + target
-	}
-	parts := []string{fmt.Sprintf("cluster_id=%d", args.ClusterID)}
-	for _, value := range []string{args.Action, args.Kind, target} {
-		if value = strings.TrimSpace(value); value != "" {
-			parts = append(parts, value)
-		}
-	}
-	if args.Replicas != nil {
-		parts = append(parts, fmt.Sprintf("replicas=%d", *args.Replicas))
-	}
-	if rv := strings.TrimSpace(args.ExpectedResourceVersion); rv != "" {
-		parts = append(parts, "resource_version="+rv)
-	}
-	return strings.Join(parts, " ")
-}
-
-// awaitDecision blocks until the approval row reaches a terminal state, then
-// returns the tool result string the ReAct loop continues with. The approve
-// REST handler runs the executor synchronously and records the result, so a
-// poll only ever reads it back — there is no double execution. "approved"
-// (executor mid-run, result not yet stored) is treated as non-terminal:
-// cloud_bash always has an executor, so it transitions to executed/failed
-// shortly; the timeout is the backstop.
 func (s CloudBashProposer) awaitDecision(ctx context.Context, id string) (string, error) {
 	deadline := time.Now().Add(ApprovalWaitTimeout)
 	ticker := time.NewTicker(approvalPollInterval)
@@ -295,9 +218,10 @@ func (s CloudBashProposer) awaitDecision(ctx context.Context, id string) (string
 	for {
 		select {
 		case <-ctx.Done():
-			// Stream closed (user navigated away) — stop waiting. The
-			// approval remains pending in the inbox for later decision.
-			return `{"status":"cancelled","message":"The approval wait was interrupted; the command was not run."}`, nil
+			if err := invalidateApproval(ctx, s.Usecase, id, "The originating request was cancelled; submit a new request."); err != nil {
+				return "", err
+			}
+			return `{"status":"cancelled","message":"The approval wait was interrupted. Check the approval record for the final execution status."}`, nil
 		case <-ticker.C:
 			a, err := s.Usecase.Get(ctx, id)
 			if err != nil {
@@ -318,7 +242,10 @@ func (s CloudBashProposer) awaitDecision(ctx context.Context, id string) (string
 				return `{"status":"rejected","message":"The user rejected this command; it was not run. Do not retry it without new instructions."}`, nil
 			}
 			if time.Now().After(deadline) {
-				return `{"status":"timeout","message":"No approval within 30 minutes; the command was not run."}`, nil
+				if err := invalidateApproval(ctx, s.Usecase, id, "The approval wait expired; submit a new request."); err != nil {
+					return "", err
+				}
+				return `{"status":"timeout","message":"The approval wait expired. Check the approval record for the final execution status."}`, nil
 			}
 		}
 	}
@@ -344,13 +271,14 @@ func (s InstallSkillProposer) ProposeInstall(ctx context.Context, url, sourceTyp
 		title = title[:120] + "…"
 	}
 	a, err := s.Usecase.Propose(ctx, managerbizapproval.ProposeInput{
-		Kind:       "install_skill",
-		Title:      title,
-		Summary:    sourceType,
-		Payload:    installSkillPayload{URL: url, Type: sourceType, Ref: ref, UserID: userID},
-		Source:     "agent",
-		SessionID:  sessionID,
-		ProposedBy: userID,
+		RuntimeVersion: string(aiopschatruntime.VersionFromContext(ctx)),
+		Kind:           "install_skill",
+		Title:          title,
+		Summary:        sourceType,
+		Payload:        installSkillPayload{URL: url, Type: sourceType, Ref: ref, UserID: userID},
+		Source:         "agent",
+		SessionID:      sessionID,
+		ProposedBy:     userID,
 	})
 	if err != nil {
 		return "", err
@@ -362,6 +290,7 @@ func (s InstallSkillProposer) ProposeInstall(ctx context.Context, url, sourceTyp
 // P2). Server/Tool/Arguments drive the executor; Command is a human-readable
 // one-liner the inline approval card shows (reuses the cloud_bash card).
 type mcpCallPayload struct {
+	Revision  string         `json:"revision,omitempty"`
 	Server    string         `json:"server"`
 	Tool      string         `json:"tool"`
 	Arguments map[string]any `json:"arguments,omitempty"`
@@ -377,9 +306,20 @@ func (s MCPCaller) CallMCPTool(ctx context.Context, server, tool string, args ma
 
 // MCPProposer queues an MCP call into the human approval inbox (default,
 // untrusted path) — same propose-confirm model as cloud_bash.
-type MCPProposer struct{ Usecase *managerbizapproval.Usecase }
+type MCPProposer struct {
+	Usecase *managerbizapproval.Usecase
+	MCP     *managerbizmcp.Usecase
+}
 
 func (s MCPProposer) ProposeMCPCallAndAwait(ctx context.Context, server, tool string, args map[string]any, sessionID, toolCallID string, userID uint64) (string, error) {
+	var revision string
+	if s.MCP != nil {
+		var err error
+		revision, err = s.MCP.Revision(ctx, server)
+		if err != nil {
+			return "", err
+		}
+	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
 		return "", fmt.Errorf("marshal MCP approval arguments: %w", err)
@@ -389,12 +329,13 @@ func (s MCPProposer) ProposeMCPCallAndAwait(ctx context.Context, server, tool st
 		cmd = cmd[:200] + "…"
 	}
 	a, err := s.Usecase.Propose(ctx, managerbizapproval.ProposeInput{
-		Kind:       "mcp_call",
-		Title:      cmd,
-		Payload:    mcpCallPayload{Server: server, Tool: tool, Arguments: args, Command: cmd},
-		Source:     "agent",
-		SessionID:  sessionID,
-		ProposedBy: userID,
+		RuntimeVersion: string(aiopschatruntime.VersionFromContext(ctx)),
+		Kind:           "mcp_call",
+		Title:          cmd,
+		Payload:        mcpCallPayload{Revision: revision, Server: server, Tool: tool, Arguments: args, Command: cmd},
+		Source:         "agent",
+		SessionID:      sessionID,
+		ProposedBy:     userID,
 	})
 	if err != nil {
 		return "", err
@@ -403,14 +344,6 @@ func (s MCPProposer) ProposeMCPCallAndAwait(ctx context.Context, server, tool st
 		emit(aiopschatruntime.Event{
 			Type: aiopschatruntime.EventApprovalPending,
 			Approval: &aiopschatruntime.ApprovalPending{
-				ApprovalID: a.ID, ToolCallID: toolCallID, Kind: "mcp_call",
-				ToolName: aiopstools.MCPToolName(server, tool), Command: cmd,
-			},
-		})
-	} else if emit := aiopsagent.EmitFromContext(ctx); emit != nil {
-		emit(aiopsagent.Event{
-			Type: aiopsagent.EventApprovalPending,
-			Approval: &aiopsagent.ApprovalPendingEvent{
 				ApprovalID: a.ID, ToolCallID: toolCallID, Kind: "mcp_call",
 				ToolName: aiopstools.MCPToolName(server, tool), Command: cmd,
 			},

@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/runtime/contract"
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
 	aiopstoolsbase "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	aiopstoolsdec "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/decorators"
@@ -17,12 +17,11 @@ import (
 	managerbizdevice "github.com/ongridio/ongrid/internal/manager/biz/device"
 	managerbizmarketplace "github.com/ongridio/ongrid/internal/manager/biz/marketplace"
 	managerbizmcp "github.com/ongridio/ongrid/internal/manager/biz/mcp"
-	managerbizsetting "github.com/ongridio/ongrid/internal/manager/biz/setting"
-	managerbizskill "github.com/ongridio/ongrid/internal/manager/biz/skill"
 	managerapprovaldata "github.com/ongridio/ongrid/internal/manager/data/approval/store"
 	managermarketplacedata "github.com/ongridio/ongrid/internal/manager/data/marketplace/store"
 	managermcpdata "github.com/ongridio/ongrid/internal/manager/data/mcp/store"
 	pagesdata "github.com/ongridio/ongrid/internal/manager/data/pages"
+	managermodelmcp "github.com/ongridio/ongrid/internal/manager/model/mcp"
 	managerserverapproval "github.com/ongridio/ongrid/internal/manager/server/approval"
 	managerserverk8s "github.com/ongridio/ongrid/internal/manager/server/k8s"
 	managerservermarketplace "github.com/ongridio/ongrid/internal/manager/server/marketplace"
@@ -36,12 +35,11 @@ import (
 	managersvck8s "github.com/ongridio/ongrid/internal/manager/service/k8s"
 	managersvcskill "github.com/ongridio/ongrid/internal/manager/service/skill"
 	"github.com/ongridio/ongrid/internal/pkg/config"
+	"github.com/ongridio/ongrid/internal/pkg/mcpclient"
 	"github.com/ongridio/ongrid/internal/pkg/notify"
 	"github.com/ongridio/ongrid/internal/pkg/runner"
 	"github.com/ongridio/ongrid/internal/pkg/secretbox"
 	"github.com/ongridio/ongrid/internal/pkg/workspace"
-	skillcore "github.com/ongridio/ongrid/internal/skill"
-	skillbuiltin "github.com/ongridio/ongrid/internal/skill/builtin"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -57,14 +55,7 @@ type extensionsModule struct {
 }
 
 func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.Logger, reg *prometheus.Registry, notifyRouter *notify.Router, storage *storageModule, settings *settingsModule, devices *devicesModule, alerts *alertsModule, tunnel *tunnelModule, aiops *aiopsModule, runtime *runtimeModule, automation *automationModule) *extensionsModule {
-	// L2 skill framework: builtin Executors registered via init() in
-	// internal/skill/builtin (imported above). Service dispatches via
-	// frontierbound.Client; audit goes to MySQL skill_executions.
-	skillSvc := managerbizskill.New(
-		tunnel.fbClient,
-		managerbizskill.NewGormAuditSink(storage.db),
-		log.With(slog.String("comp", "skill")),
-	)
+	skillSvc := aiops.skillSvc
 	// HLD-017: surface chatruntime SKILL.md skills (built-in + marketplace-
 	// installed) in the /v1/skills catalog. They live in a separate registry
 	// from skillcore, so without this an installed pack (e.g. terrashark) is
@@ -76,20 +67,11 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 	// marketplace wiring. Install / List / Uninstall on
 	// /v1/marketplace/*. The usecase reloads the chatruntime registries
 	// after every mutation so newly installed skills appear in the next
-	// chat without a restart. When the graph kernel didn't build (no
-	// LLM provider configured) the registries are nil, the marketplace
-	// still works for List/Install but the hot-reload is a no-op until
-	// the next chatruntime construction picks the disk state up.
-	var mpSkillReg managerbizmarketplace.SkillRegistry
-	var mpAgentReg managerbizmarketplace.AgentRegistry
-	if rt, ok := runtime.aiopsRuntime.(*aiopschatruntime.Runtime); ok && rt != nil {
-		if sk := rt.SkillRegistry(); sk != nil {
-			mpSkillReg = sk
-		}
-		if ag := rt.AgentRegistry(); ag != nil {
-			mpAgentReg = ag
-		}
-	}
+	// chat without a restart. Registries exist independently of runtime assembly.
+	// Reload both version-local registries, even when LLM assembly is unavailable.
+	var mpSkillReg managerbizmarketplace.SkillRegistry = registryReloaders{runtime.bootstrapSkillReg, runtime.bootstrapV2SkillReg}
+	var mpAgentReg managerbizmarketplace.AgentRegistry = registryReloaders{runtime.bootstrapAgentReg, runtime.bootstrapV2AgentReg}
+	var skillAssetLeaser managersvcaiops.SkillAssetLeaser = runtime.bootstrapSkillReg
 	mpRepo := managermarketplacedata.NewRepo(storage.db)
 	mpDevMode := strings.EqualFold(os.Getenv("ONGRID_MARKETPLACE_DEVMODE"), "true") ||
 		os.Getenv("ONGRID_MARKETPLACE_DEVMODE") == ""
@@ -151,6 +133,8 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 	approvalUC := managerbizapproval.NewUsecase(managerapprovaldata.NewRepo(storage.db), log.With(slog.String("comp", "approval")))
 	runtime.humanApprovalBroker.SetUsecase(approvalUC)
 	approvalUC.RegisterExecutor(managersvcaiops.GenericToolApprovalKind, runtime.humanApprovalBroker.Execute)
+	managersvcaiops.RegisterRuntimeApprovalExecutor(approvalUC, managersvcaiops.GenericToolApprovalKind, contract.V3, runtime.humanApprovalBroker.Execute)
+	managersvcaiops.RegisterRuntimeApprovalExecutor(approvalUC, managersvcaiops.GenericToolApprovalKind, contract.V2, runtime.humanApprovalBroker.Execute)
 	approvalHandler := managerserverapproval.NewHandler(approvalUC)
 	// HLD-017 cloud_bash producer: register the execute-on-approve executor
 	// (resolve the bound credential → inject into the Runner sandbox → run)
@@ -170,18 +154,16 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 		Runner:      cloudBashRunner,
 		Workspace:   wsMgr,
 		SkillsRoot:  marketplaceSkillsRoot,
+		SkillAssets: skillAssetLeaser,
 		Frontier:    tunnel.fbClient,
 		Edges:       devices.edgeUC,
 		Devices:     devices.deviceUC,
-		Settings:    settings.settingSvc,
-		Tools:       aiops.toolsReg,
 		Marketplace: mpUC,
 		MCP:         mcpUC,
 		Log:         log,
 	}).Register(approvalUC)
 	aiops.toolsReg.SetCloudBashProposer(managersvcaiops.CloudBashProposer{Usecase: approvalUC})
 	aiops.toolsReg.SetHostBashProposer(managersvcaiops.HostBashProposer{Usecase: approvalUC})
-	aiops.toolsReg.SetK8sActionProposer(managersvcaiops.K8sActionProposer{Usecase: approvalUC})
 	// The Actions page is a read-only projection over two immutable audit
 	// sources: graph ReviewGate decisions and legacy human approvals.
 	k8sHandler := managerserverk8s.NewHandler(devices.k8sSvc, managersvck8s.NewActionAuditReader(aiops.mutatingProposalRepo, approvalUC))
@@ -215,7 +197,17 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 	// live bag here, exactly like the AgentTool trio above. The coordinator
 	// (coordinatorToolNames) and specialist-ops (persona Tools list) filters
 	// both whitelist cloud_bash, so this single append reaches both.
+	var runtimes []extensionRuntime
 	if runtime.chatRT != nil {
+		runtime.chatRT.SetCredentialBinder(mpUC)
+		runtimes = append(runtimes, runtime.chatRT)
+	}
+	if runtime.chatV2 != nil {
+		runtime.chatV2.SetCredentialBinder(mpUC)
+		runtimes = append(runtimes, runtime.chatV2)
+	}
+	var refreshers []*managersvcaiops.MCPToolRefresher
+	for _, rt := range runtimes {
 		cbDeps := aiopstoolsdec.Deps{
 			// HLD-021: cloud_bash now BLOCKS in-tool until the human approves
 			// (synchronous propose-confirm), so the per-call timeout must
@@ -241,24 +233,22 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 			Registerer:    reg,
 			HumanApproval: runtime.humanApprovalBroker,
 		}
-		runtime.chatRT.AppendToolBag([]aiopstoolsbase.BaseTool{
+		if err := rt.AppendToolBag([]aiopstoolsbase.BaseTool{
 			aiopstoolsdec.Wrap(aiopstools.NewBashToolWithProposer(tunnel.fbClient, devices.edgeUC, devices.deviceUC, managersvcaiops.HostBashProposer{Usecase: approvalUC}, log), cbDeps),
 			aiopstoolsdec.Wrap(aiopstools.NewCloudBashTool(managersvcaiops.CloudBashProposer{Usecase: approvalUC}, log), cbDeps),
 			aiopstoolsdec.Wrap(aiopstools.NewInstallSkillTool(managersvcaiops.InstallSkillProposer{Usecase: approvalUC}, log), cbDeps),
 			aiopstoolsdec.Wrap(aiopstools.NewServePageTool(pageStore, log), quickDeps),
 			aiopstoolsdec.Wrap(aiopstools.NewSendNotificationTool(managersvcaiops.NotificationSender{Channels: alerts.alertRepo, Router: notifyRouter}, log), quickDeps),
 			aiopstoolsdec.Wrap(aiopstools.NewSendIMMessageTool(managersvcimbridge.IMMessageSender{Apps: aiops.imbridgeRepo}, log), quickDeps),
-		})
-		log.Info("host_bash + cloud_bash + install_skill + serve_page + messaging tools bolted onto chat runtime bag", slog.Int("tool_count", runtime.chatRT.ToolCount()))
-		// HLD-017: wire the active-skill → bound-credentials resolver so
-		// cloud_bash auto-injects the credentials an active skill was bound
-		// to at install time (design-time binding, no run-time choice).
-		runtime.chatRT.SetCredentialBinder(mpUC)
+		}); err != nil {
+			log.Error("append runtime extension tools failed", slog.Any("err", err))
+		}
+		log.Info("host_bash + cloud_bash + install_skill + serve_page + messaging tools bolted onto chat runtime bag", slog.Int("tool_count", rt.ToolCount()))
 		// Admin write-action gate: consult the agent/write_enabled system
 		// setting live on every chat request. When an admin turns it off the
 		// agent goes read-only (all non-read tools stripped from the LLM's
-		// toolbag). Default (unset) resolves to enabled, preserving behaviour.
-		runtime.chatRT.SetAgentWriteEnabledProvider(func(ctx context.Context) bool {
+		// toolbag). Missing settings fail closed.
+		rt.SetAgentWriteEnabledProvider(func(ctx context.Context) bool {
 			return settings.settingSvc.AgentWriteEnabled(ctx)
 		})
 		// HLD-018 P2: connect each enabled MCP server, pull its tools, and
@@ -273,16 +263,29 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 			HumanApproval: runtime.humanApprovalBroker,
 		}
 		mcpCaller := managersvcaiops.MCPCaller{Usecase: mcpUC}
-		mcpProposer := managersvcaiops.MCPProposer{Usecase: approvalUC}
+		mcpProposer := managersvcaiops.MCPProposer{Usecase: approvalUC, MCP: mcpUC}
 		// Keep the graph-facing decorators and ToolSearch's unredacted catalog
 		// in sync. Registration changes call this with one server's fresh test
 		// result, so an admin save never reconnects every MCP endpoint.
-		mcpTools := managersvcaiops.NewMCPToolRefresher(runtime.chatRT, mcpDeps, mcpCaller, mcpProposer, log)
-		mcpUC.SetToolChangeHook(mcpTools.Refresh)
-
-		// Chat path: load enabled servers at boot; later changes use the same
-		// per-server refresh hook. The FLOW path uses LIVE managersvcflow.MCPSource.
-		mcpTools.LoadEnabled(rootCtx, mcpUC)
+		mcpTools := managersvcaiops.NewMCPToolRefresher(rt, mcpDeps, mcpCaller, mcpProposer, log)
+		refreshers = append(refreshers, mcpTools)
+	}
+	mcpUC.SetToolChangeHook(func(ctx context.Context, name string, srv *managermodelmcp.Server, discovered []mcpclient.Tool) {
+		for _, refresher := range refreshers {
+			refresher.Refresh(ctx, name, srv, discovered)
+		}
+	})
+	if len(refreshers) > 0 {
+		// Discovery has one supervisor; every change fans out to both catalogs.
+		refreshers[0].LoadEnabled(rootCtx, mcpUC)
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Error("MCP refresh supervisor panic", slog.Any("panic", recovered))
+				}
+			}()
+			refreshers[0].RunRefresh(rootCtx, mcpUC, time.Minute)
+		}()
 	}
 
 	if secretbox.KeyIsWeak() {
@@ -296,44 +299,12 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 		slog.Bool("pinned_pubkey", mpPinnedKey != ""),
 	)
 
-	// Wire the multi-provider config resolver into the manager-scoped
-	// web_search built-in. Default provider is SearXNG (zero-config,
-	// docker-internal). The skill returns a skipped_reason envelope
-	// when the chosen provider is missing a key / unreachable, so this
-	// is safe to call even before any operator configures the integration.
-	skillbuiltin.SetWebSearchConfigResolver(managerbizsetting.NewWebSearchResolver(settings.settingSvc))
-
-	// Subprocess skill loader: walks each allowlist root and registers
-	// SubprocessSkills for every skill.json found. Empty dir list =
-	// nothing loaded; missing dirs are logged and skipped so a fresh
-	// install with no /etc/ongrid/skills boots cleanly.
-	if loaded, err := skillcore.LoadDirs(skillcore.LoaderConfig{
-		Dirs: cfg.Skills.ExternalDirs,
-		Logger: func(format string, args ...any) {
-			log.Info(fmt.Sprintf(format, args...), slog.String("comp", "skill-loader"))
-		},
-	}); err != nil {
-		log.Warn("skill loader returned error",
-			slog.Int("loaded", loaded),
-			slog.Any("err", err),
-		)
-	} else if loaded > 0 {
-		log.Info("subprocess skills loaded", slog.Int("count", loaded))
-	}
-
-	// Auto-register safe skills as LLM function-calling tools so the AI
-	// agent can invoke them through the same audit + permission path
-	// the HTTP layer uses. Mutating / dangerous classes are gated behind
-	// PR-G4 SOP signing and never auto-registered for the LLM.
-	aiops.toolsReg.RegisterSafeSkills(skillSvc)
 	// Inventory bridge: register every BaseTool in the bag as a skill so
 	// /skills surfaces the complete cloud-side capability inventory.
-	// Runs regardless of agent kernel (legacy / graph) so the page is
-	// populated either way. Skipped tools (already exist as skills via
+	// Runs even when the chat runtime is unavailable. Skipped tools (already exist as skills via
 	// skill_bridge) are silently bypassed. Idempotent.
 	{
 		invBag := aiops.toolsReg.BuildBaseTools()
-		invBag = aiopstools.AppendHostFilesTools(invBag, tunnel.fbClient, devices.edgeUC, devices.deviceUC, log)
 		aiops.toolsReg.RegisterBaseToolsAsSkills(invBag, log.With(slog.String("comp", "inventory-bridge")))
 		// Re-merge so flow `tool` nodes can run tools registered after the
 		// invoker was first built — cloud_bash (its proposer is wired above)
@@ -351,4 +322,26 @@ func bootstrapExtensions(rootCtx context.Context, cfg *config.Config, log *slog.
 		k8sHandler:         k8sHandler,
 		pageStore:          pageStore,
 	}
+}
+
+// extensionRuntime exposes only version-independent startup hooks.
+type extensionRuntime interface {
+	AppendToolBag([]aiopstoolsbase.BaseTool) error
+	ReplaceToolSource(string, []aiopstoolsbase.BaseTool, []aiopstoolsbase.BaseTool) error
+	ToolCount() int
+	SetAgentWriteEnabledProvider(func(context.Context) bool)
+}
+type registryReloader interface{ Reload(string, ...string) error }
+type registryReloaders []registryReloader
+
+func (rs registryReloaders) Reload(root string, extras ...string) error {
+	var errs []error
+	for _, r := range rs {
+		if r != nil {
+			if err := r.Reload(root, extras...); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }

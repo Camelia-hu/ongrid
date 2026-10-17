@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	managersvcaiops "github.com/ongridio/ongrid/internal/manager/service/aiops"
 	"log/slog"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
-	aiopschatruntime "github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
 	aiopsinvestigator "github.com/ongridio/ongrid/internal/manager/biz/aiops/investigator"
 	managerbizalert "github.com/ongridio/ongrid/internal/manager/biz/alert"
 	"github.com/ongridio/ongrid/internal/manager/biz/alert/investigator"
@@ -38,7 +38,7 @@ type automationModule struct {
 func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.Logger, reg *prometheus.Registry, notifyRouter *notify.Router, cleanup *startupCleanup, storage *storageModule, settings *settingsModule, models *modelsModule, alerts *alertsModule, telemetry *telemetryModule, aiops *aiopsModule, runtime *runtimeModule) *automationModule {
 	// Two-tier proactive investigation wiring:
 	//
-	//   1. The legacy ai_initial_diagnosis emitter (~3 paragraphs on
+	//   1. The ai_initial_diagnosis emitter (~3 paragraphs on
 	//      the alert timeline, lightweight, single LLM call via
 	//      correlate_incident) — fast read for operators glancing at
 	//      the incident timeline.
@@ -53,21 +53,21 @@ func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.
 	// Both share the alert.Investigator interface and chain via
 	// investigatorChain so each new-fire fans out to both. Either side
 	// can be nil — the chain skips nil.
-	var legacyInv managerbizalert.Investigator
+	var initialInv managerbizalert.Investigator
 	if hasConfiguredLLMProvider(models.llmRouter) {
-		legacy := aiopsinvestigator.New(
+		initial := aiopsinvestigator.New(
 			models.llmClient,
-			aiops.toolsReg,
+			managersvcaiops.NewBackgroundToolInvoker(aiops.toolsReg.BuildBaseTools().AllTools()),
 			alerts.alertRepo,
 			aiopsinvestigator.Config{},
 			log,
 		)
-		cleanup.add(legacy.Close)
-		legacyInv = legacy
-		log.Info("alert: legacy AI initial-diagnosis investigator wired",
+		cleanup.add(initial.Close)
+		initialInv = initial
+		log.Info("alert: AI initial-diagnosis investigator wired",
 			slog.String("model_source", "llm_default"))
 	} else {
-		log.Info("alert: legacy AI investigator disabled (no LLM provider)")
+		log.Info("alert: AI investigator disabled (no LLM provider)")
 	}
 
 	var (
@@ -80,7 +80,7 @@ func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.
 		rcaInvConcrete *investigator.Usecase
 	)
 	if os.Getenv("ONGRID_INVESTIGATOR_ENABLED") == "true" {
-		concreteRt, _ := runtime.aiopsRuntime.(*aiopschatruntime.Runtime)
+		concreteRt := runtime.aiopsRuntime
 		if concreteRt == nil {
 			log.Warn("structured RCA investigator skipped: chatruntime runtime not available")
 		} else {
@@ -133,7 +133,7 @@ func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.
 		}
 	}
 
-	if chained := managerbizalert.ChainInvestigators(legacyInv, rcaInv); chained != nil {
+	if chained := managerbizalert.ChainInvestigators(initialInv, rcaInv); chained != nil {
 		alerts.alertUC.SetInvestigator(chained)
 	}
 
@@ -144,7 +144,7 @@ func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.
 	reportRepo := managerreportdata.NewRepo(storage.db)
 	var reportGen managerbizreport.Generator
 	reportSchedulerReady := false
-	if reportRT, ok := runtime.aiopsRuntime.(*aiopschatruntime.Runtime); ok && reportRT != nil {
+	if reportRT := runtime.aiopsRuntime; reportRT != nil {
 		// Pass the prom query client for fleet resource trends; a typed-nil
 		// guard mirrors the tools wiring so a missing client stays a clean
 		// untyped nil (collector degrades Resource.Available=false).
@@ -194,7 +194,7 @@ func bootstrapAutomation(rootCtx context.Context, cfg *config.Config, log *slog.
 		Notify: managersvcflow.Notifier{Channels: alerts.alertRepo, Router: notifyRouter},
 		LLM:    managersvcflow.LLMRunner{Client: models.llmClient},
 	}
-	if flowRT, ok := runtime.aiopsRuntime.(*aiopschatruntime.Runtime); ok && flowRT != nil {
+	if flowRT := runtime.aiopsRuntime; flowRT != nil {
 		flowExec.Agent = managersvcflow.AgentRunner{Runtime: flowRT}
 	}
 	flowUC := managerbizflow.NewUsecase(flowRepo, flowRunRepo,

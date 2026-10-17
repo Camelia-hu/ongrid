@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"fmt"
+	managerbizsetting "github.com/ongridio/ongrid/internal/manager/biz/setting"
+	managerbizskill "github.com/ongridio/ongrid/internal/manager/biz/skill"
+	skillcore "github.com/ongridio/ongrid/internal/skill"
+	skillbuiltin "github.com/ongridio/ongrid/internal/skill/builtin"
 	"log/slog"
 	"os"
 	"strings"
 
 	managerbizaiops "github.com/ongridio/ongrid/internal/manager/biz/aiops"
-	aiopsagent "github.com/ongridio/ongrid/internal/manager/biz/aiops/agent"
 	aiopstools "github.com/ongridio/ongrid/internal/manager/biz/aiops/tools"
 	managerbizalert "github.com/ongridio/ongrid/internal/manager/biz/alert"
 	managerbizimbridge "github.com/ongridio/ongrid/internal/manager/biz/imbridge"
@@ -34,9 +38,8 @@ type aiopsModule struct {
 	toolsReg             *aiopstools.Registry
 	packetCaptureUC      *managerbizpacketcapture.Usecase
 	packetCaptureHandler *managerserverpacketcapture.Handler
-	aiopsAgent           *aiopsagent.Agent
+	skillSvc             *managerbizskill.Service
 	aiopsUsage           *managerbizaiops.UsageUsecase
-	kernel               managersvcaiops.Kernel
 }
 
 func bootstrapAIOps(cfg *config.Config, log *slog.Logger, notifyRouter *notify.Router, storage *storageModule, settings *settingsModule, models *modelsModule, devices *devicesModule, alerts *alertsModule, telemetry *telemetryModule, tunnel *tunnelModule) *aiopsModule {
@@ -151,32 +154,50 @@ func bootstrapAIOps(cfg *config.Config, log *slog.Logger, notifyRouter *notify.R
 	// find_topology_node show up in the BaseTool roster. nil-safe — the
 	// two BaseTools are gated on this exact field.
 	toolsReg.SetTopologyGraph(devices.topologyUC)
-	aiopsAgent := aiopsagent.New(
-		models.llmClient,
-		toolsReg,
-		aiopsRepo,
-		aiopsagent.Config{Model: cfg.OpenAI.Model, Temperature: 0.1, MaxIterations: 30},
-		log,
+	// L2 skill framework: builtin Executors registered via init() in
+	// internal/skill/builtin (imported above). Service dispatches via
+	// frontierbound.Client; audit goes to MySQL skill_executions.
+	skillSvc := managerbizskill.New(
+		tunnel.fbClient,
+		managerbizskill.NewGormAuditSink(storage.db),
+		log.With(slog.String("comp", "skill")),
 	)
-	aiopsAgent.SetAgentWriteEnabledProvider(func(ctx context.Context) bool {
-		return settings.settingSvc.AgentWriteEnabled(ctx)
-	})
+	// Wire the multi-provider config resolver into the manager-scoped
+	// web_search built-in. Default provider is SearXNG (zero-config,
+	// docker-internal). The skill returns a skipped_reason envelope
+	// when the chosen provider is missing a key / unreachable, so this
+	// is safe to call even before any operator configures the integration.
+	skillbuiltin.SetWebSearchConfigResolver(managerbizsetting.NewWebSearchResolver(settings.settingSvc))
+
+	// Subprocess skill loader: walks each allowlist root and registers
+	// SubprocessSkills for every skill.json found. Empty dir list =
+	// nothing loaded; missing dirs are logged and skipped so a fresh
+	// install with no /etc/ongrid/skills boots cleanly.
+	if loaded, err := skillcore.LoadDirs(skillcore.LoaderConfig{
+		Dirs: cfg.Skills.ExternalDirs,
+		Logger: func(format string, args ...any) {
+			log.Info(fmt.Sprintf(format, args...), slog.String("comp", "skill-loader"))
+		},
+	}); err != nil {
+		log.Warn("skill loader returned error",
+			slog.Int("loaded", loaded),
+			slog.Any("err", err),
+		)
+	} else if loaded > 0 {
+		log.Info("subprocess skills loaded", slog.Int("count", loaded))
+	}
+
+	// Auto-register safe skills as LLM function-calling tools so the AI
+	// agent can invoke them through the same audit + permission path
+	// the HTTP layer uses. Mutating / dangerous classes are gated behind
+	// PR-G4 SOP signing and never auto-registered for the LLM.
+	toolsReg.SetSkillRunner(skillSvc)
+
 	aiopsUsage := managerbizaiops.NewUsageUsecase(aiopsRepo, log)
 
-	// The graph-based AgentLoop is the default execution path. Operators can
-	// set ONGRID_AGENT_KERNEL=legacy for an explicit rollback while migration
-	// issues are investigated.
-	// When the env is set we build:
-	//   - RoutingChatModel (PR-1) wrapping the existing llmRouter, one
-	//     per provider id.
-	//   - Decorated BaseTool slice via Registry.BuildBaseTools +
-	//     AppendHostFilesTools, then Wrap'd with the standard chain.
-	//   - SkillRegistry / AgentRegistry from configured skill roots + ./agents
-	//     (silent on missing dirs — fresh installs boot fine).
-	//   - chatruntime.Runtime, the cutover entry the service routes to.
-	// Mismatch / build errors fall back to legacy with a logged warning.
-	kernel := managersvcaiops.ParseKernel(os.Getenv("ONGRID_AGENT_KERNEL"))
-	log.Info("aiops agent kernel selected", slog.String("kernel", string(kernel)))
+	if value := os.Getenv("ONGRID_AGENT_KERNEL"); value != "" {
+		log.Warn("ONGRID_AGENT_KERNEL is obsolete; unified runtime is always used", slog.String("value", value))
+	}
 
 	return &aiopsModule{
 		alertSvc:             alertSvc,
@@ -188,8 +209,7 @@ func bootstrapAIOps(cfg *config.Config, log *slog.Logger, notifyRouter *notify.R
 		toolsReg:             toolsReg,
 		packetCaptureUC:      packetCaptureUC,
 		packetCaptureHandler: packetCaptureHandler,
-		aiopsAgent:           aiopsAgent,
+		skillSvc:             skillSvc,
 		aiopsUsage:           aiopsUsage,
-		kernel:               kernel,
 	}
 }

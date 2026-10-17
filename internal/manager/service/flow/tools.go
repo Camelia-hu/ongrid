@@ -67,6 +67,8 @@ func (s *ToolInvoker) InvokeTool(ctx context.Context, name string, args json.Raw
 	// Tag any artifact a tool node produces (serve_page) as workflow-sourced so
 	// the operations UI's 生成来源 column distinguishes it from chat-generated pages.
 	ctx = aiopstoolsbase.WithArtifactSource(ctx, aiopstoolsbase.ArtifactSourceWorkflow)
+	// A published tool node explicitly authorizes its web-search operation.
+	ctx = aiopstoolsbase.WithWebSearchAllowed(ctx, true)
 	// MCP tool nodes dispatch LIVE through the mcp source (resolve the current
 	// server/tool, run directly without an approval card — placing the node in
 	// a published flow IS the human authorization; a per-run inbox approval is
