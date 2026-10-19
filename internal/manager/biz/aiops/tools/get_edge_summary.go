@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	alertbiz "github.com/ongridio/ongrid/internal/manager/biz/alert"
 	devicebiz "github.com/ongridio/ongrid/internal/manager/biz/device"
+	edgebiz "github.com/ongridio/ongrid/internal/manager/biz/edge"
 	devicemodel "github.com/ongridio/ongrid/internal/manager/model/device"
 	edgemodel "github.com/ongridio/ongrid/internal/manager/model/edge"
 	"github.com/ongridio/ongrid/internal/pkg/tunnel"
@@ -21,43 +24,6 @@ const ToolNameGetEdgeSummary = "get_edge_summary"
 // "what's the situation on host X".
 const GetEdgeSummaryDescription = "Return a one-shot snapshot for an edge: registration metadata, current host load (cpu/mem/load), and recent incidents in the last 24h (any status, severity >= warning). " +
 	"Use this whenever the question is about a single named host's overall state."
-
-// GetEdgeSummarySchema is the JSON Schema of the tool's argument object.
-//
-// The user-visible identifier is `device_id` (matches the @-mention chip
-// id and the Prom `device_id` label). `edge_id` / `edge_name` are kept
-// as legacy aliases so prompts that still reference the tunnel-side
-// numbering don't break — the executor reconciles both onto the same
-// underlying edge row via the device→edge junction.
-var GetEdgeSummarySchema = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "device_id": {
-      "type": "integer",
-      "description": "Numeric device id (preferred). Matches the @-mention chip id and Prom device_id label."
-    },
-    "device_name": {
-      "type": "string",
-      "description": "Device name / hostname. Used when device_id is unknown."
-    },
-    "edge_id": {
-      "type": "integer",
-      "description": "Legacy alias for device_id — accepted for back-compat."
-    },
-    "edge_name": {
-      "type": "string",
-      "description": "Legacy alias for device_name — accepted for back-compat."
-    }
-  }
-}`)
-
-// GetEdgeSummaryArgs is the typed form of GetEdgeSummarySchema.
-type GetEdgeSummaryArgs struct {
-	DeviceID   uint64 `json:"device_id,omitempty"`
-	DeviceName string `json:"device_name,omitempty"`
-	EdgeID     uint64 `json:"edge_id,omitempty"`
-	EdgeName   string `json:"edge_name,omitempty"`
-}
 
 // edgeSummaryCallTimeout caps the whole multi-step round trip. It must
 // be larger than hostLoadCallTimeout so a slow edge doesn't blow the
@@ -78,43 +44,123 @@ type EdgeSummaryIncidentRow struct {
 	LastFiredAt  time.Time `json:"last_fired_at"`
 }
 
-// executeGetEdgeSummary stitches together the edge meta + a best-effort
-// live host_load + recent incidents (any status, last 24h, severity ≥
-// warning) into a single payload. Each sub-call is best-effort: if
-// host_load fails (offline edge) the field is nil and we still return
-// meta + incidents.
-func (r *Registry) executeGetEdgeSummary(ctx context.Context, args json.RawMessage) (ExecuteResult, error) {
-	if r.edges == nil {
-		return ExecuteResult{}, fmt.Errorf("get_edge_summary: edge usecase not configured")
-	}
-	var in GetEdgeSummaryArgs
-	if err := json.Unmarshal(args, &in); err != nil {
-		return ExecuteResult{}, fmt.Errorf("get_edge_summary: bad args: %w", err)
-	}
-	// Coalesce legacy edge_* aliases into device_*.
-	if in.DeviceID == 0 && in.EdgeID != 0 {
-		in.DeviceID = in.EdgeID
-	}
-	if in.DeviceName == "" && in.EdgeName != "" {
-		in.DeviceName = in.EdgeName
-	}
-	if in.DeviceID == 0 && in.DeviceName == "" {
-		return ExecuteResult{}, fmt.Errorf("get_edge_summary: device_id or device_name required")
-	}
+// get_edge_summary.go — N+15 batch refactor. The BaseTool form
+// of get_edge_summary now takes `device_ids[]`. Each inner call still
+// runs the same 3-step stitch (edge meta + best-effort host_load + 24h
+// incidents). The outer ceiling
+// (edgeSummaryBatchTimeout) is wider than the per-id timeout so up to 4
+// inner stitches in flight can complete.
+//
+// Fan-out budget rationale: each inner already takes up to 30s
+// (edgeSummaryCallTimeout), and runBatch keeps batchConcurrency=4 in
+// flight. With 16 ids the worst-case wall time is ~30s × ⌈16/4⌉ = 120s;
+// we set the outer to 90s as the practical cap (typical batches have
+// most ids returning fast since host_load + DB read are cheap when the
+// edge is online; the outer just prevents one slow edge from wedging
+// the whole call past the LLM round-trip budget).
 
+// edgeSummaryBatchTimeout caps the whole batched run. Wider than the
+// per-id ceiling so up to batchConcurrency stitches can finish.
+const edgeSummaryBatchTimeout = ((batchMaxIDs+batchConcurrency-1)/batchConcurrency)*edgeSummaryCallTimeout + 30*time.Second
+
+// GetEdgeSummaryTool is the BaseTool form of get_edge_summary.
+type GetEdgeSummaryTool struct {
+	caller  Caller
+	edges   *edgebiz.Usecase
+	devices *devicebiz.Usecase
+	alertUC AlertUsecase
+	log     *slog.Logger
+}
+
+// NewGetEdgeSummaryTool builds the BaseTool variant.
+func NewGetEdgeSummaryTool(caller Caller, edges *edgebiz.Usecase, devices *devicebiz.Usecase, alertUC AlertUsecase, log *slog.Logger) *GetEdgeSummaryTool {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &GetEdgeSummaryTool{caller: caller, edges: edges, devices: devices, alertUC: alertUC, log: log}
+}
+
+// GetEdgeSummaryBatchArgs is the typed form of the batch schema.
+type GetEdgeSummaryBatchArgs struct {
+	DeviceIDs []uint64 `json:"device_ids"`
+}
+
+// EdgeSummaryResultEntry is one slot in the batch envelope. On success
+// Summary holds edge metadata, host load, recent incidents and plugin status.
+// On failure Error is populated.
+type EdgeSummaryResultEntry struct {
+	DeviceID uint64         `json:"device_id"`
+	Summary  map[string]any `json:"summary,omitempty"`
+	Error    string         `json:"error,omitempty"`
+}
+
+// EdgeSummaryBatchResponse is the wire envelope.
+type EdgeSummaryBatchResponse struct {
+	SuccessCount int                      `json:"success_count"`
+	ErrorCount   int                      `json:"error_count"`
+	Results      []EdgeSummaryResultEntry `json:"results"`
+}
+
+// GetEdgeSummaryBatchSchema is the JSON schema for the batched call.
+var GetEdgeSummaryBatchSchema = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "device_ids": {
+      "type": "array",
+      "items": {"type": "integer"},
+      "minItems": 0,
+      "maxItems": 16,
+      "description": "设备 id 列表，一次最多 16 个，把它们的 metadata + host_load + 24h incidents 一次性全拿回来（省得逐台单独调）。【省略或留空 = 汇总全部边端设备（最多 16 个）】，适合「巡检 / 体检所有设备」这类不指定具体 id 的请求，无需先查设备清单。"
+    }
+  }
+}`)
+
+// edgeSummaryAllCap bounds the "all edges" fan-out (device_ids omitted) so a
+// large fleet doesn't blow past maxItems / the batch timeout in one call.
+const edgeSummaryAllCap = 16
+
+// getEdgeSummaryWhenToUse — batch-first routing hint (N+15).
+const getEdgeSummaryWhenToUse = "一次给多个 device_id，把它们的 metadata + host_load + 24h incidents 一次性全拿回来（省得逐台单独调）。" +
+	"想巡检 / 体检『所有』边端而不指定具体 id 时，device_ids 直接留空即可（自动汇总全部，最多 16 个）。" +
+	"比 get_host_load + get_incident_detail 各自批量更省 LLM 轮次（每条 incidents 只回 trimmed envelope）。" +
+	"NOT for: 单设备深查（用 host_bash + ps + journalctl）/ 集群级聚合（用 rank_edges）/ " +
+	"诊断单个 incident 的 metric+log+trace 关联（用 correlate_incident）/ 列设备清单（用 query_devices）。"
+
+// Info returns metadata. Class=read.
+func (t *GetEdgeSummaryTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
+	return &basetool.ToolInfo{
+		Name:        ToolNameGetEdgeSummary,
+		Description: GetEdgeSummaryDescription,
+		WhenToUse:   getEdgeSummaryWhenToUse,
+		Parameters:  GetEdgeSummaryBatchSchema,
+		Class:       "read",
+	}, nil
+}
+
+// singleEdgeSummary assembles:
+// resolve edge → fetch roles → optional host_load → 24h incidents +
+// plugin_status. Each sub-call is best-effort — a slow Loki / offline
+// edge degrades gracefully into a partial summary, NOT an entry-level
+// Error. The only thing that turns into Error is "we can't even
+// identify the edge" (resolver failure).
+func (t *GetEdgeSummaryTool) singleEdgeSummary(ctx context.Context, deviceID uint64) EdgeSummaryResultEntry {
+	entry := EdgeSummaryResultEntry{DeviceID: deviceID}
+	if deviceID == 0 {
+		entry.Error = "device_id must be > 0"
+		return entry
+	}
 	callCtx, cancel := context.WithTimeout(ctx, edgeSummaryCallTimeout)
 	defer cancel()
 
-	edge, err := resolveEdgeForDevice(callCtx, r, in.DeviceID, in.DeviceName)
+	edge, err := t.resolveEdgeForDevice(callCtx, deviceID, "")
 	if err != nil {
-		return ExecuteResult{}, err
+		entry.Error = err.Error()
+		return entry
 	}
 
-	// Roles now live on the host Device (post device-split). Look it up
-	// best-effort via Edge.DeviceID; missing device row → empty roles.
 	var roles []string
-	if r.devices != nil && edge.DeviceID != nil {
-		if d, derr := r.devices.Get(callCtx, *edge.DeviceID); derr == nil && d != nil {
+	if t.devices != nil && edge.DeviceID != nil {
+		if d, derr := t.devices.Get(callCtx, *edge.DeviceID); derr == nil && d != nil {
 			roles = devicemodel.DecodeRoles(d.Roles)
 		}
 	}
@@ -133,14 +179,10 @@ func (r *Registry) executeGetEdgeSummary(ctx context.Context, args json.RawMessa
 		},
 	}
 
-	// Best-effort host_load. We reuse the same caller / method as
-	// get_host_load but inline-decode here so we don't reach into the
-	// other tool's executor signature. A missing fbClient (caller) or
-	// an offline edge yields host_load=null.
-	if r.caller != nil && edge.Status == edgemodel.StatusOnline {
+	if t.caller != nil && edge.Status == edgemodel.StatusOnline {
 		body, marshalErr := json.Marshal(tunnel.GetHostLoadRequest{})
 		if marshalErr == nil {
-			respBody, callErr := r.caller.Call(callCtx, edge.ID, tunnel.MethodGetHostLoad, body)
+			respBody, callErr := t.caller.Call(callCtx, edge.ID, tunnel.MethodGetHostLoad, body)
 			if callErr == nil {
 				var resp tunnel.GetHostLoadResponse
 				if json.Unmarshal(respBody, &resp) == nil {
@@ -150,17 +192,11 @@ func (r *Registry) executeGetEdgeSummary(ctx context.Context, args json.RawMessa
 		}
 	}
 
-	// Recent incidents (any status) in last 24h, severity >= warning. We
-	// pull a generous slice across all statuses and filter in memory by
-	// 24h cutoff + severity floor — the goal is "what's been firing on
-	// this host" which has to include acknowledged / silenced / resolved
-	// rows, not just currently-open ones.
-	if r.alertUC != nil {
+	if t.alertUC != nil {
 		edgeID := edge.ID
-		incidents, listErr := r.alertUC.ListIncidents(callCtx, alertbiz.IncidentFilter{
+		incidents, listErr := t.alertUC.ListIncidents(callCtx, alertbiz.IncidentFilter{
 			DeviceID: &edgeID,
-			// No Status filter — we want all lifecycle states.
-			Limit: 100,
+			Limit:    100,
 		})
 		if listErr == nil {
 			cutoff := time.Now().UTC().Add(-24 * time.Hour)
@@ -187,43 +223,93 @@ func (r *Registry) executeGetEdgeSummary(ctx context.Context, args json.RawMessa
 		}
 	}
 
-	// Plugin status is not threaded through the Registry today; surface
-	// the gap explicitly so the LLM doesn't claim coverage it doesn't
-	// have. When PluginConfigUC gets wired in, swap this for the live
-	// list-by-edge call.
 	out["plugin_status"] = "unsupported"
-
-	body, err := json.Marshal(out)
-	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("get_edge_summary: marshal: %w", err)
-	}
-	eid := edge.ID
-	return ExecuteResult{ResultJSON: body, DeviceID: &eid}, nil
+	entry.Summary = out
+	return entry
 }
 
-// resolveEdgeForDevice resolves the host edge for a device id / name.
-// Lookup order:
-//
-//  1. By id: prefer the device row (id is stable + matches the
-//     @-mention chip + Prom label), then ask the junction for the host
-//     edge. Falls back to treating the id as a legacy edge id when no
-//     device row exists, so prompts referencing the tunnel-side number
-//     still work.
-//  2. By name: device-by-name then host edge; falls back to edge-by-name
-//     for the same reason.
-//
-// All "not found" returns carry an actionable hint so the LLM has
-// something better to say than "not found".
-func resolveEdgeForDevice(ctx context.Context, r *Registry, deviceID uint64, deviceName string) (*edgemodel.Edge, error) {
+// InvokableRun fans the stitch out across device_ids and returns the
+// envelope.
+func (t *GetEdgeSummaryTool) InvokableRun(ctx context.Context, argsJSON string, _ ...basetool.InvokeOption) (string, error) {
+	if t.edges == nil {
+		return "", fmt.Errorf("get_edge_summary: edge usecase not configured")
+	}
+	var in GetEdgeSummaryBatchArgs
+	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
+		return "", fmt.Errorf("get_edge_summary: bad args: %w", err)
+	}
+	// "All edges" mode: device_ids omitted/empty → summarize every edge
+	// (capped). Lets "巡检所有设备" work without a separate list-devices step.
+	if len(in.DeviceIDs) == 0 {
+		ids, err := t.allEdgeDeviceIDs(ctx)
+		if err != nil {
+			return "", fmt.Errorf("get_edge_summary: list all edges: %w", err)
+		}
+		if len(ids) == 0 {
+			body, _ := json.Marshal(EdgeSummaryBatchResponse{Results: []EdgeSummaryResultEntry{}})
+			return string(body), nil
+		}
+		in.DeviceIDs = ids
+	} else if err := validateBatchIDs("device_ids", in.DeviceIDs); err != nil {
+		return "", fmt.Errorf("get_edge_summary: %w", err)
+	}
+
+	batchCtx, cancel := context.WithTimeout(ctx, edgeSummaryBatchTimeout)
+	defer cancel()
+
+	results := runBatch(batchCtx, in.DeviceIDs, t.singleEdgeSummary)
+	env := EdgeSummaryBatchResponse{Results: results}
+	for _, r := range results {
+		if r.Error != "" {
+			env.ErrorCount++
+		} else {
+			env.SuccessCount++
+		}
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		return "", fmt.Errorf("get_edge_summary: marshal: %w", err)
+	}
+	return string(body), nil
+}
+
+// allEdgeDeviceIDs returns identifiers for every edge (capped), used when the
+// caller omits device_ids ("summarize all edges"). Prefers the edge's linked
+// device_id; falls back to the edge id, which resolveEdgeForDevice resolves via
+// its edge-id fallback.
+func (t *GetEdgeSummaryTool) allEdgeDeviceIDs(ctx context.Context) ([]uint64, error) {
+	edges, err := t.edges.List(ctx, edgebiz.ListFilter{})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uint64, 0, len(edges))
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		if e.DeviceID != nil && *e.DeviceID != 0 {
+			ids = append(ids, *e.DeviceID)
+		} else {
+			ids = append(ids, e.ID)
+		}
+		if len(ids) >= edgeSummaryAllCap {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// resolveEdgeForDevice resolves the host edge for a device ID.
+func (t *GetEdgeSummaryTool) resolveEdgeForDevice(ctx context.Context, deviceID uint64, _ string) (*edgemodel.Edge, error) {
 	tryEdgeForDeviceID := func(id uint64) (*edgemodel.Edge, error) {
-		if r.devices == nil {
+		if t.devices == nil {
 			return nil, nil
 		}
-		dev, dErr := r.devices.Get(ctx, id)
+		dev, dErr := t.devices.Get(ctx, id)
 		if dErr != nil || dev == nil {
 			return nil, dErr
 		}
-		links := r.devices.Links()
+		links := t.devices.Links()
 		if links == nil {
 			return nil, fmt.Errorf("device %d has no edge link configured", id)
 		}
@@ -231,7 +317,7 @@ func resolveEdgeForDevice(ctx context.Context, r *Registry, deviceID uint64, dev
 		if lErr != nil {
 			return nil, fmt.Errorf("device %d (%s) has no host-edge link", id, dev.Name)
 		}
-		edge, eErr := r.edges.Get(ctx, eid)
+		edge, eErr := t.edges.Get(ctx, eid)
 		if eErr != nil {
 			return nil, fmt.Errorf("device %d → edge %d lookup: %w", id, eid, eErr)
 		}
@@ -239,34 +325,13 @@ func resolveEdgeForDevice(ctx context.Context, r *Registry, deviceID uint64, dev
 	}
 
 	if deviceID != 0 {
-		// Preferred path: id is a device id.
 		if edge, err := tryEdgeForDeviceID(deviceID); err == nil && edge != nil {
 			return edge, nil
 		}
-		// Fallback: legacy callers may have passed an edge id directly.
-		if edge, err := r.edges.Get(ctx, deviceID); err == nil && edge != nil {
+		if edge, err := t.edges.Get(ctx, deviceID); err == nil && edge != nil {
 			return edge, nil
 		}
-		return nil, fmt.Errorf("get_edge_summary: device_id=%d not found (try query_devices first to list available device ids)", deviceID)
+		return nil, fmt.Errorf("device_id=%d not found (try query_devices first)", deviceID)
 	}
-
-	// By name.
-	if r.devices != nil {
-		devs, _ := r.devices.List(ctx, devicebizListByName(deviceName))
-		for _, d := range devs {
-			if edge, err := tryEdgeForDeviceID(d.ID); err == nil && edge != nil {
-				return edge, nil
-			}
-		}
-	}
-	if edge, err := r.edges.GetByName(ctx, deviceName); err == nil && edge != nil {
-		return edge, nil
-	}
-	return nil, fmt.Errorf("get_edge_summary: no device or edge named %q (try query_devices to list)", deviceName)
-}
-
-// devicebizListByName builds a name-substring filter for device.Usecase.List
-// without forcing each call site to import the device biz package.
-func devicebizListByName(name string) devicebiz.ListFilter {
-	return devicebiz.ListFilter{Name: name, Limit: 5}
+	return nil, fmt.Errorf("device_id required")
 }

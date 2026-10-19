@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 	edgebiz "github.com/ongridio/ongrid/internal/manager/biz/edge"
 	edgemodel "github.com/ongridio/ongrid/internal/manager/model/edge"
 )
@@ -50,20 +52,57 @@ type TopologyInfo struct {
 
 const topologyCallTimeout = 60 * time.Second
 
-func (r *Registry) executeGetTopology(ctx context.Context, _ json.RawMessage) (ExecuteResult, error) {
+// GetTopologyTool reports deployment topology.
+type GetTopologyTool struct {
+	edges    *edgebiz.Usecase
+	alertUC  AlertUsecase
+	topology TopologyInfo
+	log      *slog.Logger
+}
+
+// NewGetTopologyTool builds the BaseTool variant. alertUC and edges may
+// be nil — the tool degrades to whatever it can populate. topology is a
+// value type so callers pass the resolved deployment-level facts at
+// construction time (mirrors Registry.SetTopologyInfo).
+func NewGetTopologyTool(edges *edgebiz.Usecase, alertUC AlertUsecase, topology TopologyInfo, log *slog.Logger) *GetTopologyTool {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &GetTopologyTool{edges: edges, alertUC: alertUC, topology: topology, log: log}
+}
+
+// getTopologyWhenToUse — reverse-guard against using this for per-host or
+// per-incident questions.
+const getTopologyWhenToUse = "When the user asks 'how big is the fleet', 'is loki configured', " +
+	"'what version of manager is this', or any cluster-wide deployment fact. " +
+	"NOT for a single host (use get_edge_summary). NOT for a specific incident (use get_incident_detail). " +
+	"NOT for actual metric values (use query_promql)."
+
+// Info returns metadata. Class=read.
+func (t *GetTopologyTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
+	return &basetool.ToolInfo{
+		Name:        ToolNameGetTopology,
+		Description: GetTopologyDescription,
+		WhenToUse:   getTopologyWhenToUse,
+		Parameters:  GetTopologySchema,
+		Class:       "read",
+	}, nil
+}
+
+// InvokableRun gathers topology facts with best-effort handling of missing dependencies.
+func (t *GetTopologyTool) InvokableRun(ctx context.Context, _ string, _ ...basetool.InvokeOption) (string, error) {
 	callCtx, cancel := context.WithTimeout(ctx, topologyCallTimeout)
 	defer cancel()
 
 	out := map[string]any{
-		"manager_version":      r.topology.ManagerVersion,
-		"configured_prom_url":  r.topology.ConfiguredPromURL,
-		"configured_loki_url":  r.topology.ConfiguredLokiURL,
-		"configured_tempo_url": r.topology.ConfiguredTempoURL,
+		"manager_version":      t.topology.ManagerVersion,
+		"configured_prom_url":  t.topology.ConfiguredPromURL,
+		"configured_loki_url":  t.topology.ConfiguredLokiURL,
+		"configured_tempo_url": t.topology.ConfiguredTempoURL,
 	}
 
-	// Edge fleet size + online count.
-	if r.edges != nil {
-		all, err := r.edges.List(callCtx, edgebiz.ListFilter{Limit: 5000})
+	if t.edges != nil {
+		all, err := t.edges.List(callCtx, edgebiz.ListFilter{Limit: 5000})
 		if err == nil {
 			online := 0
 			for _, e := range all {
@@ -76,9 +115,8 @@ func (r *Registry) executeGetTopology(ctx context.Context, _ json.RawMessage) (E
 		}
 	}
 
-	// Enabled rule count.
-	if r.alertUC != nil {
-		rules, err := r.alertUC.ListRules(callCtx, "")
+	if t.alertUC != nil {
+		rules, err := t.alertUC.ListRules(callCtx, "")
 		if err == nil {
 			enabled := 0
 			for _, rule := range rules {
@@ -91,16 +129,15 @@ func (r *Registry) executeGetTopology(ctx context.Context, _ json.RawMessage) (E
 		}
 	}
 
-	// Channel count via callback.
-	if r.topology.ChannelCounter != nil {
-		if n, err := r.topology.ChannelCounter(callCtx); err == nil {
+	if t.topology.ChannelCounter != nil {
+		if n, err := t.topology.ChannelCounter(callCtx); err == nil {
 			out["channel_count"] = n
 		}
 	}
 
 	body, err := json.Marshal(out)
 	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("get_topology: marshal: %w", err)
+		return "", fmt.Errorf("get_topology: marshal: %w", err)
 	}
-	return ExecuteResult{ResultJSON: body}, nil
+	return string(body), nil
 }

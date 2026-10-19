@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
+
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
+	edgebiz "github.com/ongridio/ongrid/internal/manager/biz/edge"
 )
 
 // ToolNameFindOutlierEdges is the stable wire name the LLM sees.
@@ -51,24 +55,52 @@ type OutlierEdgeRow struct {
 
 const outlierCallTimeout = 60 * time.Second
 
-// executeFindOutlierEdges builds a z-score PromQL of the shape
-//
-//	(per_edge_metric - on() group_left avg(per_edge_metric)) /
-//	    on() group_left stddev(per_edge_metric)
-//
-// then filters > sigma. The result is decorated with edge names like
-// rank_edges does.
-func (r *Registry) executeFindOutlierEdges(ctx context.Context, args json.RawMessage) (ExecuteResult, error) {
-	if r.promQuery == nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: prom query client not configured")
+// FindOutlierEdgesTool finds host metric outliers.
+type FindOutlierEdgesTool struct {
+	promQuery PromQuerier
+	edges     *edgebiz.Usecase
+	log       *slog.Logger
+}
+
+// NewFindOutlierEdgesTool builds the BaseTool variant.
+func NewFindOutlierEdgesTool(promQuery PromQuerier, edges *edgebiz.Usecase, log *slog.Logger) *FindOutlierEdgesTool {
+	if log == nil {
+		log = slog.Default()
 	}
-	if r.edges == nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: edge usecase not configured")
+	return &FindOutlierEdgesTool{promQuery: promQuery, edges: edges, log: log}
+}
+
+// findOutlierEdgesWhenToUse — anomaly-detection pivot. Reverse-guards
+// against confusing this with simple ranking.
+const findOutlierEdgesWhenToUse = "When the user asks who's an OUTLIER on cpu / mem / disk — i.e. who's deviating " +
+	"more than N sigma from the fleet baseline. " +
+	"NOT for a top-N ranking by raw value (use rank_edges). " +
+	"NOT for deviation on free-form metrics (use query_promql with stddev). " +
+	"NOT for single-host details (use get_host_load)."
+
+// Info returns metadata. Class=read.
+func (t *FindOutlierEdgesTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
+	return &basetool.ToolInfo{
+		Name:        ToolNameFindOutlierEdges,
+		Description: FindOutlierEdgesDescription,
+		WhenToUse:   findOutlierEdgesWhenToUse,
+		Parameters:  FindOutlierEdgesSchema,
+		Class:       "read",
+	}, nil
+}
+
+// InvokableRun builds the z-score PromQL and filters > sigma.
+func (t *FindOutlierEdgesTool) InvokableRun(ctx context.Context, argsJSON string, _ ...basetool.InvokeOption) (string, error) {
+	if t.promQuery == nil {
+		return "", fmt.Errorf("find_outlier_edges: prom query client not configured")
+	}
+	if t.edges == nil {
+		return "", fmt.Errorf("find_outlier_edges: edge usecase not configured")
 	}
 
 	var in FindOutlierEdgesArgs
-	if err := json.Unmarshal(args, &in); err != nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: bad args: %w", err)
+	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
+		return "", fmt.Errorf("find_outlier_edges: bad args: %w", err)
 	}
 	// Whitelist cpu/mem/disk explicitly. rankMetricExpr also accepts
 	// load/composite (for rank_edges), but z-score outlier detection on
@@ -78,7 +110,7 @@ func (r *Registry) executeFindOutlierEdges(ctx context.Context, args json.RawMes
 	case "cpu", "mem", "disk":
 		// ok
 	default:
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: metric must be cpu, mem or disk; got %q", in.Metric)
+		return "", fmt.Errorf("find_outlier_edges: metric must be cpu, mem or disk; got %q", in.Metric)
 	}
 	base, label, _ := rankMetricExpr(in.Metric)
 	if in.Sigma <= 0 {
@@ -88,9 +120,6 @@ func (r *Registry) executeFindOutlierEdges(ctx context.Context, args json.RawMes
 		in.Sigma = 10
 	}
 
-	// `on() group_left` broadcasts the scalar avg/stddev across every
-	// per-edge sample. Without it Prom drops the whole vector because
-	// label sets don't match.
 	expr := fmt.Sprintf(
 		`((%s) - on() group_left() avg(%s)) / on() group_left() stddev(%s) > %g`,
 		base, base, base, in.Sigma,
@@ -102,16 +131,16 @@ func (r *Registry) executeFindOutlierEdges(ctx context.Context, args json.RawMes
 
 	callCtx, cancel := context.WithTimeout(ctx, outlierCallTimeout)
 	defer cancel()
-	res, err := r.promQuery.QueryRange(callCtx, expr, start, end, step)
+	res, err := t.promQuery.QueryRange(callCtx, expr, start, end, step)
 	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: dispatch: %w", err)
+		return "", fmt.Errorf("find_outlier_edges: dispatch: %w", err)
 	}
 
 	rankRows, err := decodeRankSeries(res, label)
 	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: decode: %w", err)
+		return "", fmt.Errorf("find_outlier_edges: decode: %w", err)
 	}
-	decorateRankRows(callCtx, r.edges, rankRows)
+	decorateRankRows(callCtx, t.edges, rankRows)
 	rows := make([]OutlierEdgeRow, 0, len(rankRows))
 	for _, rr := range rankRows {
 		rows = append(rows, OutlierEdgeRow{
@@ -129,7 +158,7 @@ func (r *Registry) executeFindOutlierEdges(ctx context.Context, args json.RawMes
 		"metric":   in.Metric,
 	})
 	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("find_outlier_edges: marshal: %w", err)
+		return "", fmt.Errorf("find_outlier_edges: marshal: %w", err)
 	}
-	return ExecuteResult{ResultJSON: out}, nil
+	return string(out), nil
 }
