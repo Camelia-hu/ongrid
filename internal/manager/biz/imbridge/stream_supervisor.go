@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,6 +174,21 @@ func (s *StreamSupervisor) reconcileOnce(ctx context.Context) {
 	}
 }
 
+// redactSensitive scrubs credential values from a provider error before it is
+// recorded in StreamHealth.LastError. The app row carries the plaintext
+// credentials, and providers can embed them in error text — Telegram puts the
+// bot token in the request URL, so an HTTP transport error echoes it. The app
+// DTO hides the secret, but last_error is user-visible, so it must be scrubbed
+// here too.
+func redactSensitive(s string, app *model.ImApp) string {
+	for _, secret := range []string{app.AppSecret, app.VerifyToken, app.EncryptKey} {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, "[redacted]")
+		}
+	}
+	return s
+}
+
 // runClientWithRestart wraps the client.Run call with exponential
 // backoff. Reconnect logic inside the SDK handles transient network
 // errors; we only see Run return on terminal errors or supervisor
@@ -189,12 +205,21 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 				slog.String("provider", client.ProviderName()),
 				slog.Uint64("im_app_id", slot.app.ID),
 				slog.Any("panic", r))
-			s.health.Record(slot.app.ID, StreamHealth{
-				State:     StreamStateRetrying,
-				LastError: fmt.Sprintf("panic: %v", r),
-			})
+			// Record the panic and drop the slot only if this goroutine still
+			// owns the app. After a credential rotation a stale client can
+			// panic *after* its replacement has started (the SDK exceeds the
+			// stop timeout and keeps spinning); recording unconditionally here
+			// would flip the replacement's healthy "running" back to "retrying".
+			// Holding s.mu keeps the ownership check and the health write
+			// atomic with respect to reconcile replacing the slot. The store is
+			// an in-memory map under its own lock — no I/O, no callback into
+			// the supervisor — so this neither deadlocks nor couples the locks.
 			s.mu.Lock()
 			if s.running[slot.app.ID] == slot {
+				s.health.Record(slot.app.ID, StreamHealth{
+					State:     StreamStateRetrying,
+					LastError: redactSensitive(fmt.Sprintf("panic: %v", r), slot.app),
+				})
 				delete(s.running, slot.app.ID)
 			}
 			s.mu.Unlock()
@@ -209,7 +234,7 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
 			s.health.Record(slot.app.ID, StreamHealth{
 				State:     StreamStateRetrying,
-				LastError: err.Error(),
+				LastError: redactSensitive(err.Error(), slot.app),
 			})
 			s.log.Warn("stream client exited; reconnect",
 				slog.String("provider", client.ProviderName()),

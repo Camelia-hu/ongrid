@@ -377,3 +377,94 @@ func TestStreamSupervisor_WhenClientPanics_RecoversAndRetries(t *testing.T) {
 		}
 	})
 }
+
+// A provider error can embed the app secret (Telegram puts the bot token in
+// the request URL, so an HTTP transport error echoes it). last_error is
+// user-visible, so the supervisor must scrub the credential before recording.
+func TestStreamSupervisor_WhenClientReturns_RedactsSecretFromError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		health := NewStreamHealthStore()
+		app := &model.ImApp{ID: 1, Provider: "test", AppID: "app", AppSecret: "sekret-token"}
+		s := NewStreamSupervisor(streamRepoFunc(func(context.Context) ([]*model.ImApp, error) {
+			return []*model.ImApp{app}, nil
+		}), nil, health, discardLogger())
+		s.RegisterFactory("test", func(*model.ImApp, *Bridge) (StreamClient, error) {
+			return streamClientFunc(func(context.Context) error {
+				return errors.New(`Post "https://api.telegram.org/botsekret-token/getUpdates": dial tcp: connection refused`)
+			}), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { cancel(); s.shutdown() }()
+
+		s.reconcileOnce(ctx)
+		synctest.Wait()
+
+		got, ok := health.Get(app.ID)
+		if !ok {
+			t.Fatal("no health recorded")
+		}
+		if got.State != StreamStateRetrying {
+			t.Fatalf("state = %q, want %q", got.State, StreamStateRetrying)
+		}
+		if strings.Contains(got.LastError, "sekret-token") {
+			t.Fatalf("last_error leaked the secret: %q", got.LastError)
+		}
+		if !strings.Contains(got.LastError, "[redacted]") {
+			t.Fatalf("last_error = %q, want the secret redacted", got.LastError)
+		}
+	})
+}
+
+// After a credential rotation the stale client can exceed the stop timeout and
+// panic once its replacement is already running. The recover path must not
+// clobber the replacement's healthy "running" with "retrying".
+func TestStreamSupervisor_WhenStaleClientPanicsAfterReplacement_KeepsReplacementHealth(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		health := NewStreamHealthStore()
+		old := &model.ImApp{ID: 1, Provider: "feishu", AppID: "old", AppSecret: "old-secret"}
+		next := &model.ImApp{ID: 1, Provider: "feishu", AppID: "old", AppSecret: "new-secret"}
+		apps := []*model.ImApp{old}
+		s := NewStreamSupervisor(streamRepoFunc(func(context.Context) ([]*model.ImApp, error) {
+			return apps, nil
+		}), nil, health, discardLogger())
+		panicNow := make(chan struct{})
+		oldStarted := make(chan struct{})
+		newStarted := make(chan struct{})
+		s.RegisterFactory("feishu", func(app *model.ImApp, _ *Bridge) (StreamClient, error) {
+			return streamClientFunc(func(ctx context.Context) error {
+				if app == old {
+					close(oldStarted)
+					<-ctx.Done()
+					<-panicNow // stale client ignores cancel until told to panic
+					panic("stale client exploded")
+				}
+				close(newStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			}), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { cancel(); s.shutdown() }()
+
+		s.reconcileOnce(ctx)
+		<-oldStarted
+		synctest.Wait()
+
+		apps = []*model.ImApp{next}
+		s.reconcileOnce(ctx)
+		<-newStarted
+		synctest.Wait()
+
+		if got, ok := health.Get(next.ID); !ok || got.State != StreamStateRunning {
+			t.Fatalf("replacement state = %q ok = %v, want running", got.State, ok)
+		}
+
+		close(panicNow)
+		synctest.Wait()
+
+		got, ok := health.Get(next.ID)
+		if !ok || got.State != StreamStateRunning {
+			t.Fatalf("stale panic clobbered replacement health: %+v (ok = %v)", got, ok)
+		}
+	})
+}
