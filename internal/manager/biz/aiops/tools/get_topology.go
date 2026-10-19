@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
+	devicebiz "github.com/ongridio/ongrid/internal/manager/biz/device"
 	edgebiz "github.com/ongridio/ongrid/internal/manager/biz/edge"
 	edgemodel "github.com/ongridio/ongrid/internal/manager/model/edge"
 )
@@ -18,7 +19,7 @@ const ToolNameGetTopology = "get_topology"
 // GetTopologyDescription pushes the model toward this tool when the
 // question is about the deployment as a whole — version, fleet size,
 // which observability backends are wired in.
-const GetTopologyDescription = "Return high-level deployment topology: manager version, edge fleet size + online count, configured Prom/Loki/Tempo URLs, channel count, enabled rule count. " +
+const GetTopologyDescription = "Return high-level deployment topology: manager version, separate Host counts and Edge installation counts, configured Prom/Loki/Tempo URLs, channel count, enabled rule count. " +
 	"Use this for questions like 'how big is the fleet' or 'is loki configured'."
 
 // GetTopologySchema is the JSON Schema of the tool's argument object.
@@ -52,8 +53,9 @@ type TopologyInfo struct {
 
 const topologyCallTimeout = 60 * time.Second
 
-// GetTopologyTool reports deployment topology.
+// GetTopologyTool reports Host inventory and Edge installation counts separately.
 type GetTopologyTool struct {
+	devices  *devicebiz.Usecase
 	edges    *edgebiz.Usecase
 	alertUC  AlertUsecase
 	topology TopologyInfo
@@ -71,11 +73,16 @@ func NewGetTopologyTool(edges *edgebiz.Usecase, alertUC AlertUsecase, topology T
 	return &GetTopologyTool{edges: edges, alertUC: alertUC, topology: topology, log: log}
 }
 
+func (t *GetTopologyTool) WithDevices(devices *devicebiz.Usecase) *GetTopologyTool {
+	t.devices = devices
+	return t
+}
+
 // getTopologyWhenToUse — reverse-guard against using this for per-host or
 // per-incident questions.
 const getTopologyWhenToUse = "When the user asks 'how big is the fleet', 'is loki configured', " +
 	"'what version of manager is this', or any cluster-wide deployment fact. " +
-	"NOT for a single host (use get_edge_summary). NOT for a specific incident (use get_incident_detail). " +
+	"NOT for a single host (use get_host_summary). NOT for a specific incident (use get_incident_detail). " +
 	"NOT for actual metric values (use query_promql)."
 
 // Info returns metadata. Class=read.
@@ -89,7 +96,9 @@ func (t *GetTopologyTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
 	}, nil
 }
 
-// InvokableRun gathers topology facts with best-effort handling of missing dependencies.
+// InvokableRun assembles the topology snapshot. Mirror of
+// Missing optional dependencies only omit their corresponding fields; they
+// drops the corresponding count from the output.
 func (t *GetTopologyTool) InvokableRun(ctx context.Context, _ string, _ ...basetool.InvokeOption) (string, error) {
 	callCtx, cancel := context.WithTimeout(ctx, topologyCallTimeout)
 	defer cancel()
@@ -99,6 +108,22 @@ func (t *GetTopologyTool) InvokableRun(ctx context.Context, _ string, _ ...baset
 		"configured_prom_url":  t.topology.ConfiguredPromURL,
 		"configured_loki_url":  t.topology.ConfiguredLokiURL,
 		"configured_tempo_url": t.topology.ConfiguredTempoURL,
+	}
+
+	if t.devices != nil {
+		hosts, err := t.devices.List(callCtx, devicebiz.ListFilter{Limit: 5000})
+		if err != nil {
+			out["host_inventory_error"] = err.Error()
+		} else {
+			online := 0
+			for _, host := range hosts {
+				if host.Online {
+					online++
+				}
+			}
+			out["host_count"] = len(hosts)
+			out["online_host_count"] = online
+		}
 	}
 
 	if t.edges != nil {
@@ -111,7 +136,8 @@ func (t *GetTopologyTool) InvokableRun(ctx context.Context, _ string, _ ...baset
 				}
 			}
 			out["edge_count"] = len(all)
-			out["online_count"] = online
+			out["online_count"] = online // legacy: Edge installations, not Hosts
+			out["online_edge_count"] = online
 		}
 	}
 

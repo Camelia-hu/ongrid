@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -31,8 +30,8 @@ const ToolNameCorrelateIncident = "correlate_incident"
 // to the LLM. Phrased so the model picks this whenever it has an
 // incident_id and wants to diagnose without chaining ten round-trips.
 const CorrelateIncidentDescription = "Pull all signals around an incident: " +
-	"the metric series that fired the rule, error logs from the same edge in the same time window, " +
-	"slow/error traces, and recent edge state changes. " +
+	"the metric series that fired the rule, error logs from the same host in the same time window, " +
+	"slow/error traces, and recent host state changes. " +
 	"Returns one bundled JSON the LLM can reason over without further tool calls."
 
 // correlateIncidentTimeout caps the overall tool run. Each sub-call gets
@@ -47,7 +46,7 @@ const correlateMaxResponseBytes = 100 * 1024
 
 // AlertUsecase is the narrow surface this and the other alert-flavoured
 // tools (query_incidents / query_alert_rules / get_incident_detail /
-// get_edge_summary / get_topology) need from the manager/alert biz layer.
+// get_host_summary / get_topology) need from the manager/alert biz layer.
 // *alertbiz.Usecase satisfies it; tests inject a fake.
 //
 // Declared once here so registry.alertUC can stay a single field across
@@ -70,7 +69,7 @@ type correlateIncidentBundle struct {
 	MetricPanel []metricSeries    `json:"metric_panel,omitempty"`
 	LogPanel    []logEntry        `json:"log_panel,omitempty"`
 	TracePanel  []traceEntry      `json:"trace_panel,omitempty"`
-	Edge        *edgeSnapshot     `json:"edge,omitempty"`
+	Host        *hostSnapshot     `json:"host,omitempty"`
 	Skipped     map[string]string `json:"skipped,omitempty"`
 	Truncated   map[string]int    `json:"truncated,omitempty"`
 }
@@ -117,7 +116,8 @@ type traceEntry struct {
 	StartTime  string `json:"start_time,omitempty"`
 }
 
-type edgeSnapshot struct {
+type hostSnapshot struct {
+	CurrentEdgeID      *uint64      `json:"current_edge_id,omitempty"`
 	ID                 uint64       `json:"id"`
 	Name               string       `json:"name"`
 	Status             string       `json:"status"`
@@ -573,7 +573,7 @@ func (t *CorrelateIncidentTool) singleCorrelate(ctx context.Context, incidentID 
 				bundle.LogPanel = entries
 			}
 		} else {
-			bundle.Skipped["log_panel"] = "incident has no edge_id"
+			bundle.Skipped["log_panel"] = "incident has no device_id"
 		}
 	} else {
 		bundle.Skipped["log_panel"] = "log query client not configured"
@@ -598,12 +598,14 @@ func (t *CorrelateIncidentTool) singleCorrelate(ctx context.Context, incidentID 
 		bundle.Skipped["trace_panel"] = "trace query client not configured"
 	}
 
-	if inc.DeviceID != nil && t.edges != nil {
-		snap := t.queryEdgeSnapshot(callCtx, *inc.DeviceID, inc.FirstFiredAt)
-		bundle.Edge = snap
+	if inc.DeviceID != nil && t.devices != nil {
+		snap := t.queryHostSnapshot(callCtx, *inc.DeviceID, inc.FirstFiredAt)
+		bundle.Host = snap
 		if snap == nil {
-			bundle.Skipped["edge"] = "device host edge could not be resolved"
+			bundle.Skipped["host"] = "host could not be resolved"
 		}
+	} else if inc.DeviceID != nil {
+		bundle.Skipped["host"] = "host service not configured"
 	}
 
 	if len(bundle.Skipped) == 0 {
@@ -746,33 +748,26 @@ func (t *CorrelateIncidentTool) queryTracePanel(ctx context.Context, service str
 	return entries, nil
 }
 
-// queryEdgeSnapshot resolves a known Device ID without legacy raw-Edge fallback.
-func (t *CorrelateIncidentTool) queryEdgeSnapshot(ctx context.Context, deviceID uint64, firedAt time.Time) *edgeSnapshot {
-	if deviceID == 0 || t.edges == nil || t.devices == nil || t.devices.Links() == nil {
-		return nil
-	}
-	edgeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+// queryHostSnapshot reads Host identity and observations independently of Edge installation.
+func (t *CorrelateIncidentTool) queryHostSnapshot(ctx context.Context, deviceID uint64, firedAt time.Time) *hostSnapshot {
+	snap := &hostSnapshot{ID: deviceID}
+	hostCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	edgeID, err := t.devices.Links().LookupEdgeForDevice(edgeCtx, deviceID, devicemodel.EdgeDeviceRelationHost)
-	if err != nil || edgeID == 0 {
-		if err != nil && !errors.Is(err, context.Canceled) && t.log != nil {
-			t.log.Debug("correlate_incident: host edge resolution failed",
-				slog.Uint64("device_id", deviceID), slog.Any("err", err))
-		}
+	if t.devices == nil {
 		return nil
 	}
-	edge, err := t.edges.Get(edgeCtx, edgeID)
-	if err != nil || edge == nil {
-		if err != nil && !errors.Is(err, context.Canceled) && t.log != nil {
-			t.log.Debug("correlate_incident: edge lookup failed",
-				slog.Uint64("edge_id", edgeID), slog.Any("err", err))
-		}
+	host, err := t.devices.Get(hostCtx, deviceID)
+	if err != nil || host == nil {
 		return nil
 	}
-	snap := &edgeSnapshot{ID: edge.ID, Name: edge.Name, Status: edge.Status, LastSeenAt: edge.LastSeenAt}
-	if d, err := t.devices.Get(edgeCtx, deviceID); err == nil && d != nil {
-		snap.Roles = devicemodel.DecodeRoles(d.Roles)
+	snap.Name = host.Name
+	snap.LastSeenAt = host.LastSeenAt
+	snap.Roles = devicemodel.DecodeRoles(host.Roles)
+	snap.Status = "offline"
+	if host.Online {
+		snap.Status = "online"
 	}
+	snap.CurrentEdgeID = host.CurrentEdgeID
 
 	if t.promQuery != nil {
 		load := &currentLoad{}

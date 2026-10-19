@@ -94,14 +94,14 @@ type EdgeRow struct {
 // queryEdgesCallTimeout caps the biz call.
 const queryEdgesCallTimeout = 60 * time.Second
 
-// QueryEdgesTool lists devices, falling back to edges when the device usecase is unavailable.
+// QueryEdgesTool lists durable devices independently of Edge installations.
 type QueryEdgesTool struct {
 	devices *devicebiz.Usecase
 	edges   *edgebiz.Usecase
 	log     *slog.Logger
 }
 
-// NewQueryEdgesTool accepts either the device or edge usecase.
+// NewQueryEdgesTool requires a device usecase for inventory queries.
 func NewQueryEdgesTool(devices *devicebiz.Usecase, edges *edgebiz.Usecase, log *slog.Logger) *QueryEdgesTool {
 	if log == nil {
 		log = slog.Default()
@@ -113,8 +113,8 @@ func NewQueryEdgesTool(devices *devicebiz.Usecase, edges *edgebiz.Usecase, log *
 // chain. Reverse-guards against drilling into specific signals before
 // pinning the device id.
 const queryEdgesWhenToUse = "When the user wants the LIST of devices / hosts (filter by role / online / freshness / name substring / IP address), " +
-	"or as the FIRST step to grab a device_id you'll then feed into get_host_load / query_promql / get_edge_summary. " +
-	"NOT for the per-device deep dive (use get_edge_summary or correlate_incident). " +
+	"or as the FIRST step to grab a device_id you'll then feed into get_host_load / query_promql / get_host_summary. " +
+	"NOT for the per-device deep dive (use get_host_summary or correlate_incident). " +
 	"NOT for log/metric/trace content (use the matching query_* tool)."
 
 // Info returns metadata. Class=read.
@@ -130,7 +130,7 @@ func (t *QueryEdgesTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
 
 // InvokableRun lists devices matching the filter.
 func (t *QueryEdgesTool) InvokableRun(ctx context.Context, argsJSON string, _ ...basetool.InvokeOption) (string, error) {
-	if t.devices == nil && t.edges == nil {
+	if t.devices == nil {
 		return "", fmt.Errorf("query_devices: device usecase not configured")
 	}
 	var in QueryEdgesArgs
@@ -219,45 +219,5 @@ func (t *QueryEdgesTool) InvokableRun(ctx context.Context, argsJSON string, _ ..
 		return string(out), nil
 	}
 
-	// Legacy fallback path (edges usecase only).
-	all, err := t.edges.List(callCtx, edgebiz.ListFilter{
-		Status: in.Status,
-		Name:   in.NameContains,
-		Limit:  in.Limit,
-	})
-	if err != nil {
-		return "", fmt.Errorf("query_devices: list edges: %w", err)
-	}
-	var cutoff time.Time
-	if in.LastSeenWithinMinutes > 0 {
-		cutoff = time.Now().UTC().Add(-time.Duration(in.LastSeenWithinMinutes) * time.Minute)
-	}
-	rows := make([]EdgeRow, 0, len(all))
-	for _, e := range all {
-		if !cutoff.IsZero() {
-			if e.LastSeenAt == nil || e.LastSeenAt.Before(cutoff) {
-				continue
-			}
-		}
-		if in.NameContains != "" && !strings.Contains(e.Name, in.NameContains) {
-			continue
-		}
-		rows = append(rows, EdgeRow{
-			ID:         e.ID,
-			Name:       e.Name,
-			Online:     e.Status == "online",
-			LastSeenAt: e.LastSeenAt,
-		})
-		if len(rows) >= in.Limit {
-			break
-		}
-	}
-	out, err := json.Marshal(map[string]any{
-		"devices": rows,
-		"count":   len(rows),
-	})
-	if err != nil {
-		return "", fmt.Errorf("query_devices: marshal: %w", err)
-	}
-	return string(out), nil
+	return "", fmt.Errorf("query_devices: device usecase not configured")
 }

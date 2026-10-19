@@ -28,7 +28,7 @@ type Caller interface {
 // column.
 //
 // Post-split (May 2026): renamed EdgeID → DeviceID. Numerically the
-// values are the same — the legacy chat_tool_calls.edge_id column is
+// values are independent — the legacy chat_tool_calls.edge_id column is
 // kept as the storage column name (audit-only) but the semantic
 // interpretation is the host device id.
 type ExecuteResult struct {
@@ -320,13 +320,13 @@ func (r *Registry) BuildBaseTools() *ToolBag {
 		out = append(out, NewQueryNetworkDevicesTool(r.devices, r.devices.NetworkDiscovery(), r.log))
 		out = append(out, NewQueryNetworkInterfacesTool(r.devices, r.devices.NetworkDiscovery(), r.log))
 	}
-	if r.edges != nil {
-		out = append(out, NewGetTopologyTool(r.edges, r.alertUC, r.topology, r.log))
+	if r.edges != nil || r.devices != nil {
+		out = append(out, NewGetTopologyTool(r.edges, r.alertUC, r.topology, r.log).WithDevices(r.devices))
 	}
-	// 8: rank_edges — gated on Prom + edges
-	if r.promQuery != nil && r.edges != nil {
-		out = append(out, NewRankEdgesTool(r.promQuery, r.edges, r.log))
-		out = append(out, NewFindOutlierEdgesTool(r.promQuery, r.edges, r.log))
+	// 8: host ranking — gated on Prom + devices
+	if r.promQuery != nil && r.devices != nil {
+		out = append(out, NewRankHostsTool(r.promQuery, r.devices, r.log))
+		out = append(out, NewFindOutlierHostsTool(r.promQuery, r.devices, r.log))
 	}
 	// 9-11: alert-flavoured tools — gated on alertUC.
 	if r.alertUC != nil {
@@ -339,10 +339,10 @@ func (r *Registry) BuildBaseTools() *ToolBag {
 	if r.auditLister != nil {
 		out = append(out, NewQueryChangeEventsTool(r.auditLister, r.log))
 	}
-	// 12: get_edge_summary — gated on edges (alert/devices/caller are
+	// 12: get_host_summary — gated on devices (alert/caller are
 	// best-effort).
-	if r.edges != nil {
-		out = append(out, NewGetEdgeSummaryTool(r.caller, r.edges, r.devices, r.alertUC, r.log))
+	if r.devices != nil {
+		out = append(out, NewGetHostSummaryTool(r.caller, r.edges, r.devices, r.alertUC, r.log))
 	}
 	// 13: correlate_incident requires all four signal sources.
 	if r.alertUC != nil && r.promQuery != nil && r.logQuery != nil && r.traceQuery != nil {

@@ -21,7 +21,7 @@ func TestBuildBaseTools_MinimalDependencies(t *testing.T) {
 	regMin := NewRegistry(&fakeCaller{}, uc, nil, nil, nil, nil, nil, slog.Default())
 	assertToolNames(t, regMin.BuildBaseTools(), []string{
 		ToolNameGetHostLoad, ToolNameGetProcessList, ToolNameQueryEdges,
-		ToolNameGetTopology, ToolNameGetEdgeSummary, ToolSearchToolName,
+		ToolNameGetTopology, ToolSearchToolName,
 	})
 	assertToolNames(t, NewRegistry(nil, nil, nil, nil, nil, nil, nil, slog.Default()).BuildBaseTools(), []string{
 		ToolNameGetHostLoad, ToolNameGetProcessList, ToolSearchToolName,
@@ -35,15 +35,16 @@ func TestBuildBaseTools_FullSetWithAllDeps(t *testing.T) {
 	tq := &fakeTraceQuerier{}
 	au := &fakeAlertUC{}
 
-	reg := NewRegistry(&fakeCaller{}, uc, nil, pq, lq, tq, au, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), pq, lq, tq, au, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{})
 	assertToolNames(t, reg.BuildBaseTools(), []string{
 		ToolNameGetHostLoad, ToolNameGetProcessList, ToolNameQueryPromQL,
 		ToolNameListMetricCatalog, ToolNameListDatabaseSources, ToolNameAnalyzeDatabaseStatus,
 		ToolNameQueryLogQL, ToolNameQueryTraceQL, ToolNameQueryEdges, ToolNameGetTopology,
-		ToolNameRankEdges, ToolNameFindOutlierEdges, ToolNameQueryIncidents,
-		ToolNameGetIncidentDetail, ToolNameQueryAlertRules, ToolNameGetEdgeSummary,
+		ToolNameRankHosts, ToolNameFindOutlierHosts, ToolNameQueryIncidents,
+		ToolNameGetIncidentDetail, ToolNameQueryAlertRules, ToolNameGetHostSummary,
 		ToolNameCorrelateIncident, ToolSearchToolName,
+		"host_restart_service", "host_bash", "host_find_large_files", "host_du_summary", "host_stat_file",
 	})
 }
 
@@ -266,4 +267,17 @@ func containsName(names []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestBuildBaseTools_HostObservationsWithoutEdgeService(t *testing.T) {
+	devices := devicebiz.NewUsecase(&hostInventoryFixture{}, nil, nil)
+	bag := NewRegistry(nil, nil, devices, &fakePromQuerier{}, nil, nil, nil, nil).BuildBaseTools()
+	for _, name := range []string{ToolNameQueryEdges, ToolNameGetTopology, ToolNameGetHostSummary, ToolNameRankHosts, ToolNameFindOutlierHosts} {
+		baseToolByName(t, bag, name)
+	}
+	for _, old := range []string{"get_edge_summary", "rank_edges", "find_outlier_edges"} {
+		if containsName(toolInfoNames(t, bag.AllTools()), old) {
+			t.Errorf("legacy tool exposed to model: %s", old)
+		}
+	}
 }

@@ -23,7 +23,7 @@ type SkillRunner interface {
 // "schema" field) so we forward it verbatim — manifests should already
 // be in the function-calling shape. Otherwise we derive the schema from
 // the metadata's ParamSchema. Edge-scoped skills get an additional
-// required `edge_id` integer; manager-scoped skills don't.
+// required `device_id` integer; manager-scoped skills don't.
 func buildSkillToolSchema(e skillcore.Executor) (json.RawMessage, error) {
 	meta := e.Metadata()
 	// Prefer the unified BuildSchema helper which honors the
@@ -86,9 +86,7 @@ func buildSkillToolSchema(e skillcore.Executor) (json.RawMessage, error) {
 }
 
 // newSkillExecutor returns the skill execution function. For edge-scoped
-// skills it pulls device_id out of the LLM args (with edge_id as a
-// legacy fallback) and resolves it to the host edge_id via the
-// edge_devices junction before invoking the skill. For manager-scoped
+// skills resolve device_id through the current Host binding before invoking the skill. For manager-scoped
 // skills (web_search, subprocess packs) it forwards args verbatim.
 func (r *Registry) newSkillExecutor(svc SkillRunner, key string, scope skillcore.Scope) func(ctx context.Context, args json.RawMessage) (ExecuteResult, error) {
 	return func(ctx context.Context, args json.RawMessage) (ExecuteResult, error) {
@@ -102,32 +100,28 @@ func (r *Registry) newSkillExecutor(svc SkillRunner, key string, scope skillcore
 			envelope = map[string]json.RawMessage{}
 		}
 
-		var edgeID uint64
+		var edgeID, deviceID uint64
 		if scope == skillcore.ScopeHost {
-			var deviceID uint64
 			if raw, ok := envelope["device_id"]; ok {
 				if err := json.Unmarshal(raw, &deviceID); err != nil {
 					return ExecuteResult{}, fmt.Errorf("skill %q: device_id must be integer: %w", key, err)
 				}
 				delete(envelope, "device_id")
 			}
-			// Legacy alias — accept edge_id as device_id.
-			if deviceID == 0 {
-				if raw, ok := envelope["edge_id"]; ok {
-					if err := json.Unmarshal(raw, &deviceID); err != nil {
-						return ExecuteResult{}, fmt.Errorf("skill %q: edge_id must be integer: %w", key, err)
-					}
-					delete(envelope, "edge_id")
-				}
+			if _, exists := envelope["edge_id"]; exists {
+				return ExecuteResult{}, fmt.Errorf("skill %q: use device_id for host targets", key)
 			}
+
 			if deviceID == 0 {
 				return ExecuteResult{}, fmt.Errorf("skill %q: device_id required", key)
 			}
-			// Resolve device_id → host edge_id via the junction. If that
-			// fails, fall back to treating the value as a raw edge_id —
-			// preserves the legacy behaviour when junction rows are
-			// missing in older deployments.
-			edgeID = r.resolveEdgeForDeviceID(ctx, deviceID)
+			// Resolve device_id → current Edge through the verified binding.
+			// Never reinterpret a Host ID as an Edge ID.
+			var resolveErr error
+			edgeID, resolveErr = NewDeviceResolver(r.devices, r.edges).ResolveEdgeID(ctx, deviceID)
+			if resolveErr != nil {
+				return ExecuteResult{}, resolveErr
+			}
 			if edgeID == 0 {
 				return ExecuteResult{}, fmt.Errorf("skill %q: device_id=%d has no host-edge link (try query_devices to list available device ids)", key, deviceID)
 			}
@@ -169,25 +163,10 @@ func (r *Registry) newSkillExecutor(svc SkillRunner, key string, scope skillcore
 		}
 		result := ExecuteResult{ResultJSON: body}
 		if edgeID != 0 {
-			eid := edgeID
-			result.DeviceID = &eid
+			result.DeviceID = &deviceID
 		}
 		return result, nil
 	}
-}
-
-// resolveEdgeForDeviceID returns the host edge_id for a device id, or 0
-// when the device has no Type=Host junction row. Falls back to treating
-// the input as an edge id directly when the device row doesn't exist —
-// preserves back-compat with prompts that already think in edge ids.
-//
-// PR-9 of routes this through the shared DeviceResolver so
-// the same rule applies uniformly across host_files / skill_bridge /
-// any future ScopeHost tool. The Registry-method shape is preserved
-// so call sites stay one-line.
-func (r *Registry) resolveEdgeForDeviceID(ctx context.Context, deviceID uint64) uint64 {
-	eid, _ := NewDeviceResolver(r.devices, r.edges).ResolveEdgeID(ctx, deviceID)
-	return eid
 }
 
 // SetSkillRunner 在构建目录前注入 Skill 服务，所有入口使用相同适配器。

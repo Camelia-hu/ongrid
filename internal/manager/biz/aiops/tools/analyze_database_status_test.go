@@ -85,7 +85,7 @@ func promVector(items ...promTestValue) *promquery.InstantResult {
 func TestAnalyzeDatabaseStatus_RegisteredWhenPromEdgesAndPluginConfigsPresent(t *testing.T) {
 	deviceID := uint64(42)
 	uc := edgebiz.NewUsecase(newFakeEdgeRepo(&edgemodel.Edge{ID: 1, Name: "node-a", DeviceID: &deviceID}), nil, nil, slog.Default())
-	reg := NewRegistry(&fakeCaller{}, uc, nil, &fakeDatabaseProm{}, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), &fakeDatabaseProm{}, nil, nil, nil, slog.Default())
 
 	if containsToolName(t, reg.BuildBaseTools().AllTools(), ToolNameAnalyzeDatabaseStatus) {
 		t.Fatalf("%s should not be in BaseTool bag before plugin config lister is wired", ToolNameAnalyzeDatabaseStatus)
@@ -99,7 +99,7 @@ func TestAnalyzeDatabaseStatus_RegisteredWhenPromEdgesAndPluginConfigsPresent(t 
 
 func TestAnalyzeDatabaseStatus_NotRegisteredWhenPromNil(t *testing.T) {
 	uc := edgebiz.NewUsecase(newFakeEdgeRepo(), nil, nil, slog.Default())
-	reg := NewRegistry(&fakeCaller{}, uc, nil, nil, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), nil, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{}})
 
 	if containsName(toolInfoNames(t, reg.BuildBaseTools().AllTools()), ToolNameAnalyzeDatabaseStatus) {
@@ -156,7 +156,7 @@ func TestListDatabaseSources_FromPluginConfigs(t *testing.T) {
 	deviceID := uint64(42)
 	edge := &edgemodel.Edge{ID: 1, Name: "db-node", DeviceID: &deviceID}
 	uc := edgebiz.NewUsecase(newFakeEdgeRepo(edge), nil, nil, slog.Default())
-	reg := NewRegistry(&fakeCaller{}, uc, nil, nil, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), nil, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
@@ -253,7 +253,7 @@ func TestAnalyzeDatabaseStatus_MySQLConnectionPressure(t *testing.T) {
 		`sum(increase(mysql_global_status_aborted_connects{` + selector + `}[15m]))`:                                                                                                                      promVector(promTestValue{value: "0"}),
 		`100 * (1 - sum(rate(mysql_global_status_innodb_buffer_pool_reads{` + selector + `}[5m])) / clamp_min(sum(rate(mysql_global_status_innodb_buffer_pool_read_requests{` + selector + `}[5m])), 1))`: promVector(promTestValue{value: "96"}),
 	}}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
@@ -370,7 +370,7 @@ func TestAnalyzeDatabaseStatus_PostgreSQLObjectInventory(t *testing.T) {
 		`count(count by (datname) (pg_database_size_bytes{` + selector + `}))`:                     promVector(promTestValue{value: "2"}),
 		`count(count by (schemaname, relname) (pg_stat_user_tables_n_live_tup{` + selector + `}))`: promVector(promTestValue{value: "17"}),
 	}}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
@@ -427,7 +427,7 @@ func TestAnalyzeDatabaseStatus_MongoDBLimitedMetricsCapability(t *testing.T) {
 		),
 		`min(mongodb_up{` + selector + `})`: promVector(promTestValue{value: "1"}),
 	}}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
@@ -554,7 +554,7 @@ func TestAnalyzeDatabaseStatus_MongoDBServerStatusMetrics(t *testing.T) {
 		`sum(increase(mongodb_profile_slow_query_count{` + selector + `}[15m]))`:                                                                                                promVector(promTestValue{value: "0"}),
 		`max(mongodb_pbm_cluster_backup_configured{` + selector + `})`:                                                                                                          promVector(promTestValue{value: "1"}),
 	}}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
@@ -635,7 +635,7 @@ func TestAnalyzeDatabaseStatus_CustomMetricsDatabaseTarget(t *testing.T) {
 		`max(redis_memory_used_bytes{` + selector + `})`: promVector(promTestValue{value: "81"}),
 		`max(redis_memory_max_bytes{` + selector + `})`:  promVector(promTestValue{value: "100"}),
 	}}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		2: {
 			{
@@ -827,7 +827,7 @@ func TestAnalyzeDatabaseStatus_PromErrorStaysStructured(t *testing.T) {
 			`sum(count by (__name__) ({` + selector + `}))`: errors.New("prom 500"),
 		},
 	}
-	reg := NewRegistry(&fakeCaller{}, uc, nil, prom, nil, nil, nil, slog.Default())
+	reg := NewRegistry(&fakeCaller{}, uc, testHostInventory(t, uc), prom, nil, nil, nil, slog.Default())
 	reg.SetPluginConfigLister(fakePluginConfigLister{rows: map[uint64][]edgebiz.PluginRow{
 		1: {
 			{
