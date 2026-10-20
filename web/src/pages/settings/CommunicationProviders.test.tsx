@@ -2,7 +2,7 @@ import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { http, HttpResponse } from 'msw';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import SettingsChannels from './Channels';
 import SettingsNotifications from './Notifications';
@@ -97,5 +97,68 @@ describe('communication provider settings', () => {
     expect(card).toHaveTextContent('重连中');
     // An app the supervisor has not observed must not be labelled stopped.
     expect(within(card).queryByText('已停止')).not.toBeInTheDocument();
+  });
+
+  const slackApp = (state: string) => ({
+    id: 1, provider: 'slack', mode: 'stream', name: '值班机器人', app_id: 'T001',
+    has_secret: true, enabled: true, idle_timeout_seconds: 0,
+    created_at: now, updated_at: now, stream: { state, updated_at: now },
+  });
+
+  it('picks up a stream state change while the page stays open', async () => {
+    const states = ['running', 'retrying', 'running'];
+    let call = 0;
+    server.use(
+      http.get('/api/v1/im/apps', () => {
+        const state = states[Math.min(call, states.length - 1)];
+        call += 1;
+        return HttpResponse.json({ items: [slackApp(state)], total: 1 });
+      }),
+    );
+
+    // Capture the poll tick instead of waiting for it. Deterministic, and it
+    // avoids fake timers interacting with msw. Same approach as
+    // Integrations.test.tsx.
+    const ticks: Array<() => void> = [];
+    const intervalSpy = vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+      if (typeof handler === 'function') ticks.push(() => handler());
+      return ticks.length;
+    }) as typeof window.setInterval);
+
+    try {
+      render(<MemoryRouter><SettingsChannels /></MemoryRouter>);
+      expect(await screen.findByText('运行中')).toBeInTheDocument();
+      // updated_at is surfaced so operators can judge how old the state is.
+      expect(screen.getByTitle(now)).toBeInTheDocument();
+      expect(ticks.length).toBeGreaterThan(0);
+
+      await act(async () => { ticks[0]?.(); });
+      expect(await screen.findByText('重连中')).toBeInTheDocument();
+
+      await act(async () => { ticks[0]?.(); });
+      expect(await screen.findByText('运行中')).toBeInTheDocument();
+      expect(call).toBe(3);
+    } finally {
+      intervalSpy.mockRestore();
+    }
+  });
+
+  it('refreshes the stream state on demand', async () => {
+    let call = 0;
+    server.use(
+      http.get('/api/v1/im/apps', () => {
+        call += 1;
+        return HttpResponse.json({ items: [slackApp(call === 1 ? 'running' : 'retrying')], total: 1 });
+      }),
+    );
+
+    render(<MemoryRouter><SettingsChannels /></MemoryRouter>);
+    expect(await screen.findByText('运行中')).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await act(async () => { await user.click(screen.getByRole('button', { name: /刷新/ })); });
+
+    expect(await screen.findByText('重连中')).toBeInTheDocument();
+    expect(call).toBe(2);
   });
 });

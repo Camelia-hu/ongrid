@@ -11,7 +11,7 @@ import { Select } from '@/components/ui/Select';
 // alert delivery).
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Plus, Loader2, Pencil, Trash2, Eye, EyeOff, MessagesSquare } from 'lucide-react';
+import { Plus, Loader2, Pencil, Trash2, Eye, EyeOff, MessagesSquare, RefreshCw } from 'lucide-react';
 import { ApiError } from '@/api/client';
 import {
   createIMApp,
@@ -32,6 +32,8 @@ import { Button, Card, Chip } from '@/components/ui';
 import { Modal } from '@/components/Modal';
 import { CommunicationProviderIcon } from '@/components/icons/Provider';
 import { useI18n } from '@/i18n/locale';
+import { relativeTime } from '@/lib/format';
+import { usePoll } from '@/lib/usePoll';
 
 const PROVIDER_META: Record<IMProvider, { labelZh: string; labelEn: string; hintZh: string; hintEn: string }> = {
   feishu: {
@@ -62,6 +64,12 @@ const PROVIDER_META: Record<IMProvider, { labelZh: string; labelEn: string; hint
 
 const IM_PROVIDERS: IMProvider[] = ['feishu', 'dingtalk', 'telegram', 'slack'];
 
+// The supervisor mirrors stream state every 30s (StreamSupervisor.reconcile),
+// so polling faster than that only re-reads identical data. 15s halves the
+// worst-case UI lag without meaningful load: one lightweight list request, and
+// only while the tab is visible (usePoll pauses otherwise).
+const STREAM_STATE_POLL_MS = 15_000;
+
 type IMEditorState =
   | { mode: 'create'; provider: IMProvider }
   | { mode: 'edit'; app: IMApp };
@@ -70,6 +78,7 @@ export default function SettingsChannels() {
   const { tr } = useI18n();
   const [items, setItems] = useState<IMApp[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [editor, setEditor] = useState<IMEditorState | null>(null);
   const [deleting, setDeleting] = useState<IMApp | null>(null);
@@ -91,6 +100,22 @@ export default function SettingsChannels() {
 
   useEffect(() => {
     void fetchAll();
+  }, [fetchAll]);
+
+  // Silent re-read. Passing fetchAll straight to usePoll would invoke it with
+  // no arguments, so silent would default to false and every tick would swap
+  // the list for the loading card.
+  const pollApps = useCallback(() => fetchAll(true), [fetchAll]);
+  usePoll(pollApps, STREAM_STATE_POLL_MS);
+
+  // Manual refresh gets its own flag: reusing `loading` would blank the page.
+  const refreshNow = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchAll(true);
+    } finally {
+      setRefreshing(false);
+    }
   }, [fetchAll]);
 
   const onSaved = async () => {
@@ -130,6 +155,16 @@ export default function SettingsChannels() {
           <div className="mb-1 flex items-center gap-2 text-zinc-200">
             <MessagesSquare size={14} className="text-zinc-400" />
             <span className="font-medium">{tr('IM — 双向聊天', 'Channels — two-way chat')}</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto"
+              onClick={() => void refreshNow()}
+              disabled={refreshing}
+            >
+              <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
+              {tr('刷新', 'Refresh')}
+            </Button>
           </div>
           {tr(
             '配置飞书 / 钉钉 / Telegram / Slack 机器人，群里 @bot 或私聊就能开多轮会话。推荐 ',
@@ -289,6 +324,13 @@ function IMProviderCard({
                   </Chip>
                   <Chip tone={app.mode === 'stream' ? 'info' : 'warning'}>{app.mode}</Chip>
                   <StreamStateBadge health={app.stream} />
+                  {/* Process-level state is re-stamped on every transition, so for
+                      a running client this reads as "attempting since". */}
+                  {app.stream && (
+                    <span className="text-[11px] text-zinc-500" title={app.stream.updated_at}>
+                      {relativeTime(app.stream.updated_at)}
+                    </span>
+                  )}
                   {!app.has_secret && <Chip tone="warning">{tr('缺凭证', 'No secret')}</Chip>}
                 </div>
                 <div className="mt-1 truncate font-mono text-[11px] text-zinc-500">{app.app_id}</div>
