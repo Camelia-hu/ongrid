@@ -31,6 +31,7 @@ type aiopsModule struct {
 	alertSvc             *managersvcalert.Service
 	imbridgeRepo         *managerimbridgedata.Repo
 	imbridgeUC           *managerbizimbridge.UC
+	imbridgeStreamHealth *managerbizimbridge.StreamHealthStore
 	aiopsRepo            *manageraiopsdata.SessionRepo
 	operationUC          *managerbizaiops.OperationUsecase
 	mutatingProposalRepo *manageraiopsdata.MutatingProposalRepo
@@ -63,7 +64,10 @@ func bootstrapAIOps(cfg *config.Config, log *slog.Logger, notifyRouter *notify.R
 		log.Error("imbridge: migrate failed", slog.Any("err", err))
 	}
 	imbridgeRepo := managerimbridgedata.New(storage.db)
-	imbridgeUC := managerbizimbridge.NewUC(imbridgeRepo)
+	// Stream runtime health is shared: the stream supervisor writes it, the
+	// admin API reads it through the UC (Settings → Channels).
+	imbridgeStreamHealth := managerbizimbridge.NewStreamHealthStore()
+	imbridgeUC := managerbizimbridge.NewUC(imbridgeRepo, imbridgeStreamHealth)
 
 	// manager/aiops biz + service + server.
 	//
@@ -202,6 +206,7 @@ func bootstrapAIOps(cfg *config.Config, log *slog.Logger, notifyRouter *notify.R
 		alertSvc:             alertSvc,
 		imbridgeRepo:         imbridgeRepo,
 		imbridgeUC:           imbridgeUC,
+		imbridgeStreamHealth: imbridgeStreamHealth,
 		aiopsRepo:            aiopsRepo,
 		operationUC:          operationUC,
 		mutatingProposalRepo: mutatingProposalRepo,

@@ -2,7 +2,9 @@ package imbridge
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,9 +45,14 @@ const streamStopTimeout = 10 * time.Second
 // Lifecycle of an individual client: it lives inside a context whose
 // parent is the supervisor's own context. Cancelling the supervisor
 // (manager shutdown) propagates a graceful Stop to every client.
+//
+// Every transition it observes is mirrored into a StreamHealthStore so an
+// operator can see whether a client is attached at all — the credentials
+// probe on Settings → Channels cannot answer that.
 type StreamSupervisor struct {
 	repo      StreamRepo
 	bridge    *Bridge
+	health    *StreamHealthStore
 	factories map[string]StreamClientFactory // provider -> factory
 	log       *slog.Logger
 	mu        sync.Mutex
@@ -59,13 +66,14 @@ type streamSlot struct {
 	done   chan struct{}
 }
 
-func NewStreamSupervisor(repo StreamRepo, bridge *Bridge, log *slog.Logger) *StreamSupervisor {
+func NewStreamSupervisor(repo StreamRepo, bridge *Bridge, health *StreamHealthStore, log *slog.Logger) *StreamSupervisor {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &StreamSupervisor{
 		repo:      repo,
 		bridge:    bridge,
+		health:    health,
 		factories: map[string]StreamClientFactory{},
 		log:       log.With(slog.String("comp", "imbridge.stream")),
 		running:   map[uint64]*streamSlot{},
@@ -122,6 +130,11 @@ func (s *StreamSupervisor) reconcileOnce(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	s.stopClients(ctx, stopping)
+	// Record outside the lock: the store carries its own lock, and calling
+	// into it while holding s.mu would couple the two.
+	for id := range stopping {
+		s.health.Record(id, StreamHealth{State: StreamStateStopped})
+	}
 	if ctx.Err() != nil {
 		return
 	}
@@ -161,21 +174,79 @@ func (s *StreamSupervisor) reconcileOnce(ctx context.Context) {
 	}
 }
 
+// redactSensitive scrubs credential values from a provider error before it is
+// recorded in StreamHealth.LastError. The app row carries the plaintext
+// credentials, and providers can embed them in error text — Telegram puts the
+// bot token in the request URL, so an HTTP transport error echoes it. The app
+// DTO hides the secret, but last_error is user-visible, so it must be scrubbed
+// here too.
+func redactSensitive(s string, app *model.ImApp) string {
+	for _, secret := range []string{app.AppSecret, app.VerifyToken, app.EncryptKey} {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, "[redacted]")
+		}
+	}
+	return s
+}
+
 // runClientWithRestart wraps the client.Run call with exponential
 // backoff. Reconnect logic inside the SDK handles transient network
 // errors; we only see Run return on terminal errors or supervisor
 // cancellation.
 func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *streamSlot, client StreamClient) {
 	defer close(slot.done)
+	// A provider client that panics must not take the manager down with it.
+	// The recovered goroutine leaves nothing behind, so the slot is dropped
+	// and reported as retrying: keeping it would leave an entry that reads
+	// as running while no client exists.
+	defer func() {
+		if r := recover(); r != nil {
+			// Redact once, reuse twice: the panic value can carry a credential
+			// (providers embed request URLs in their errors), and this text ends
+			// up in the log as well as in the user-visible LastError.
+			reason := redactSensitive(fmt.Sprintf("panic: %v", r), slot.app)
+			s.log.Error("stream client panic",
+				slog.String("provider", client.ProviderName()),
+				slog.Uint64("im_app_id", slot.app.ID),
+				slog.String("panic", reason))
+			// Record the panic and drop the slot only if this goroutine still
+			// owns the app. After a credential rotation a stale client can
+			// panic *after* its replacement has started (the SDK exceeds the
+			// stop timeout and keeps spinning); recording unconditionally here
+			// would flip the replacement's healthy "running" back to "retrying".
+			// Holding s.mu keeps the ownership check and the health write
+			// atomic with respect to reconcile replacing the slot. The store is
+			// an in-memory map under its own lock — no I/O, no callback into
+			// the supervisor — so this neither deadlocks nor couples the locks.
+			s.mu.Lock()
+			if s.running[slot.app.ID] == slot {
+				s.health.Record(slot.app.ID, StreamHealth{
+					State:     StreamStateRetrying,
+					LastError: reason,
+				})
+				delete(s.running, slot.app.ID)
+			}
+			s.mu.Unlock()
+		}
+	}()
 	backoff := time.Second
 	const maxBackoff = 60 * time.Second
 	for ctx.Err() == nil {
+		// Process-level state: an attempt is in flight. This does not prove
+		// the long connection is established — see StreamStateRunning.
+		s.health.Record(slot.app.ID, StreamHealth{State: StreamStateRunning})
 		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
+			// Same text feeds LastError and the log, so redact once.
+			safeErr := redactSensitive(err.Error(), slot.app)
+			s.health.Record(slot.app.ID, StreamHealth{
+				State:     StreamStateRetrying,
+				LastError: safeErr,
+			})
 			s.log.Warn("stream client exited; reconnect",
 				slog.String("provider", client.ProviderName()),
 				slog.Uint64("im_app_id", slot.app.ID),
 				slog.Duration("backoff", backoff),
-				slog.Any("err", err))
+				slog.String("err", safeErr))
 		}
 		if ctx.Err() != nil {
 			return
@@ -221,9 +292,23 @@ func (s *StreamSupervisor) stopClients(ctx context.Context, slots map[uint64]*st
 		select {
 		case <-slot.done:
 		case <-stopCtx.Done():
-			s.log.Warn("stream client did not stop",
+			// The client ignored cancellation past the deadline. Go cannot kill a
+			// goroutine, so reconcile abandons this one on purpose: a leaked
+			// goroutine is better than a dead reconcile loop (issue #517). The
+			// consequences are spelled out in the log because they are invisible
+			// anywhere else — this path is the only evidence that a provider
+			// client is not honouring its context.
+			provider := ""
+			if slot.app != nil {
+				provider = slot.app.Provider
+			}
+			s.log.Warn("stream client did not stop within the stop timeout; abandoning it",
 				slog.Uint64("im_app_id", id),
-				slog.Any("err", stopCtx.Err()))
+				slog.String("provider", provider),
+				slog.Duration("timeout", streamStopTimeout),
+				slog.Any("err", stopCtx.Err()),
+				slog.String("impact", "the goroutine and its connection are leaked until the manager restarts; a replacement is started in the same reconcile pass, so the old client can briefly run alongside it - duplicate events are possible (the bridge dedups them, it does not prevent them) and poll-based providers such as Telegram getUpdates reject the new poller while the old one still polls; a repeating message here means the provider client is not honouring context cancellation and needs fixing at the source"),
+			)
 		}
 	}
 }
