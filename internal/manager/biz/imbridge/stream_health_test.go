@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestStreamHealthStore_RecordAndGet(t *testing.T) {
@@ -140,4 +141,39 @@ func TestStreamHealthStore_ConcurrentAccess(t *testing.T) {
 		}(id)
 	}
 	wg.Wait()
+}
+
+// Re-observing the same state must not move the timestamp: updated_at marks when
+// the state began, which is what the Channels UI renders as "how long has this
+// been broken". Only the reason is refreshed. A retry loop re-records retrying
+// every few seconds, so without this the UI reset to "just now" each cycle.
+func TestStreamHealthStore_RepeatedSameState_KeepsUpdatedAt(t *testing.T) {
+	store := NewStreamHealthStore()
+	store.Record(7, StreamHealth{State: StreamStateRetrying, LastError: "dial tcp: first"})
+	first, _ := store.Get(7)
+
+	time.Sleep(2 * time.Millisecond)
+	store.Record(7, StreamHealth{State: StreamStateRetrying, LastError: "dial tcp: second"})
+
+	got, _ := store.Get(7)
+	if !got.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("updated_at moved from %v to %v on a same-state Record", first.UpdatedAt, got.UpdatedAt)
+	}
+	if got.LastError != "dial tcp: second" {
+		t.Fatalf("last_error = %q, want the newest reason", got.LastError)
+	}
+}
+
+func TestStreamHealthStore_StateChange_RestampsUpdatedAt(t *testing.T) {
+	store := NewStreamHealthStore()
+	store.Record(7, StreamHealth{State: StreamStateRunning})
+	running, _ := store.Get(7)
+
+	time.Sleep(2 * time.Millisecond)
+	store.Record(7, StreamHealth{State: StreamStateRetrying, LastError: "boom"})
+
+	got, _ := store.Get(7)
+	if !got.UpdatedAt.After(running.UpdatedAt) {
+		t.Fatalf("updated_at = %v, want later than %v after a state change", got.UpdatedAt, running.UpdatedAt)
+	}
 }

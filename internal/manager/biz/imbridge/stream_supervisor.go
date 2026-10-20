@@ -35,6 +35,12 @@ type StreamRepo interface {
 
 const streamStopTimeout = 10 * time.Second
 
+// connectGrace is how long one attempt must outlive before it is recorded as
+// running. StreamClient has no "connected" callback — Run blocks for as long as
+// the long connection is healthy — so surviving the grace window is the only
+// observable proxy for "it came up". See runClientWithRestart.
+const connectGrace = 5 * time.Second
+
 // StreamSupervisor owns one long-running goroutine per
 // (enabled, stream-mode) ImApp. On a reconcile interval (default 30s)
 // it diffs DB state vs. running clients:
@@ -231,11 +237,48 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 	}()
 	backoff := time.Second
 	const maxBackoff = 60 * time.Second
+	// A freshly spawned slot has nothing better to report than "an attempt is in
+	// flight". Every later attempt has to earn it — see connectGrace below.
+	s.health.Record(slot.app.ID, StreamHealth{State: StreamStateRunning})
 	for ctx.Err() == nil {
-		// Process-level state: an attempt is in flight. This does not prove
-		// the long connection is established — see StreamStateRunning.
-		s.health.Record(slot.app.ID, StreamHealth{State: StreamStateRunning})
-		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
+		// Record running only once the attempt has outlived connectGrace. A client
+		// that fails immediately (bad token, Socket Mode disabled) would otherwise
+		// flap running -> retrying on every retry, and because Record re-stamps
+		// UpdatedAt the Channels UI could never show how long the app had been
+		// broken: it kept resetting to "just now".
+		attemptDone := make(chan struct{})
+		graceDone := make(chan struct{})
+		go func() {
+			defer close(graceDone)
+			timer := time.NewTimer(connectGrace)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				// Process-level state: the attempt is still in flight after the
+				// grace window, which is as close to "connected" as a
+				// StreamClient lets us observe.
+				//
+				// Claim it only while this goroutine still owns the app. A panic
+				// unwinds past the join below without cancelling ctx, so an armed
+				// timer would otherwise resurrect "running" five seconds after the
+				// recovered panic had already reported "retrying" and dropped the
+				// slot. Holding s.mu keeps the ownership check and the write atomic
+				// with respect to reconcile, exactly like the recover branch.
+				s.mu.Lock()
+				if s.running[slot.app.ID] == slot && ctx.Err() == nil {
+					s.health.Record(slot.app.ID, StreamHealth{State: StreamStateRunning})
+				}
+				s.mu.Unlock()
+			case <-attemptDone:
+			case <-ctx.Done():
+			}
+		}()
+		err := client.Run(ctx)
+		close(attemptDone)
+		// The grace goroutine must be gone before retrying is recorded, otherwise
+		// a timer firing concurrently could overwrite it with running.
+		<-graceDone
+		if err != nil && ctx.Err() == nil {
 			// Same text feeds LastError and the log, so redact once.
 			safeErr := redactSensitive(err.Error(), slot.app)
 			s.health.Record(slot.app.ID, StreamHealth{

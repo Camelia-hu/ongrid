@@ -8,15 +8,17 @@ import (
 // StreamState is the runtime state of one app's stream client, as last
 // observed by the supervisor.
 //
-// It is deliberately a *process-level* view. StreamStateRunning means the
-// supervisor has an attempt in flight; it does not prove the long
-// connection is established. Connection-level state (connected /
-// reconnecting / disconnected) needs per-provider hooks and is not
+// It is deliberately a *process-level* view. StreamStateRunning means an attempt
+// has outlived the supervisor's grace window (the client did not fail fast); it
+// does not prove the long connection is established. Connection-level state
+// (connected / reconnecting / disconnected) needs per-provider hooks and is not
 // covered here.
 type StreamState string
 
 const (
-	// StreamStateRunning: the supervisor has an attempt in flight for the app.
+	// StreamStateRunning: an attempt outlived the supervisor's grace window, so
+	// the client did not fail immediately. Still process-level — it does not prove
+	// the long connection is established.
 	StreamStateRunning StreamState = "running"
 	// StreamStateRetrying: Run returned and the supervisor is waiting out its
 	// backoff before the next attempt. LastError carries the reason.
@@ -34,8 +36,9 @@ const (
 // Channels test endpoint only proves the credentials are valid, so without
 // this a dead long connection looks healthy (issue #517).
 //
-// UpdatedAt is stamped by every Record, so for a running client it also
-// reads as "attempting since".
+// UpdatedAt marks when State last changed, so it reads as "in this state since":
+// for retrying that answers "how long has this been broken", for running "how
+// long has this attempt been up".
 type StreamHealth struct {
 	State     StreamState `json:"state"`
 	LastError string      `json:"last_error,omitempty"`
@@ -59,16 +62,23 @@ func NewStreamHealthStore() *StreamHealthStore {
 	return &StreamHealthStore{states: make(map[uint64]StreamHealth)}
 }
 
-// Record stores the latest health for one app. UpdatedAt is stamped with
-// the manager clock so the UI can show staleness without trusting a
-// caller clock. An appID of 0 is ignored.
+// Record stores the latest health for one app. UpdatedAt marks when the *state*
+// changed: re-recording the same state keeps the original timestamp (LastError
+// is still refreshed). Without that, a client that fails and retries every few
+// seconds re-stamped UpdatedAt on every attempt, so the Channels UI could never
+// show how long the app had been broken. An appID of 0 is ignored.
 func (s *StreamHealthStore) Record(appID uint64, h StreamHealth) {
 	if s == nil || appID == 0 {
 		return
 	}
-	h.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if prev, ok := s.states[appID]; ok && prev.State == h.State {
+		h.UpdatedAt = prev.UpdatedAt
+	} else {
+		h.UpdatedAt = now
+	}
 	s.states[appID] = h
 }
 

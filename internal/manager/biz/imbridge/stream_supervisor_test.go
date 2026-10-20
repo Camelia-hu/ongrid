@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -268,13 +269,163 @@ func TestStreamSupervisor_WhenClientReturns_RecordsRetryingWithError(t *testing.
 		if !ok {
 			t.Fatal("no health recorded")
 		}
-		// The goroutine records "running" before each attempt and blocks in its
-		// backoff sleep in between, so the state observed here is retrying.
+		// A fresh slot records running once before the loop; the client then fails
+		// immediately, so the state observed here is retrying.
 		if got.State != StreamStateRetrying {
 			t.Fatalf("state = %q, want %q", got.State, StreamStateRetrying)
 		}
 		if got.LastError != "dial tcp: connection refused" {
 			t.Fatalf("last_error = %q", got.LastError)
+		}
+	})
+}
+
+// A client that fails faster than connectGrace must never flap to running. It
+// used to: the supervisor recorded running at the top of every attempt, so a
+// fast-failing client (bad token, Socket Mode disabled) alternated
+// running -> retrying on each retry. Because Record re-stamped updated_at each
+// time, the Channels badge read "alive" half the time and its "how long has this
+// been broken" timestamp kept resetting to "just now".
+func TestStreamSupervisor_WhenClientFailsFast_DoesNotFlapToRunning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		health := NewStreamHealthStore()
+		app := &model.ImApp{ID: 1, Provider: "test", AppID: "app"}
+		s := NewStreamSupervisor(streamRepoFunc(func(context.Context) ([]*model.ImApp, error) {
+			return []*model.ImApp{app}, nil
+		}), nil, health, discardLogger())
+		var attempts atomic.Int64
+		s.RegisterFactory("test", func(*model.ImApp, *Bridge) (StreamClient, error) {
+			return streamClientFunc(func(ctx context.Context) error {
+				attempts.Add(1)
+				// Give up well inside connectGrace but long enough that this test's
+				// sampling point lands mid-attempt.
+				select {
+				case <-time.After(100 * time.Millisecond):
+					return errors.New("dial tcp: connection refused")
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { cancel(); s.shutdown() }()
+
+		s.reconcileOnce(ctx)
+		synctest.Wait()
+
+		// Attempt #1 runs from t=0 to t=100ms, then the supervisor waits out its
+		// 1s backoff (t=200ms is inside that wait).
+		time.Sleep(200 * time.Millisecond)
+		synctest.Wait()
+		failed, ok := health.Get(app.ID)
+		if !ok {
+			t.Fatal("no health recorded")
+		}
+		if failed.State != StreamStateRetrying {
+			t.Fatalf("state after the first fast failure = %q, want %q", failed.State, StreamStateRetrying)
+		}
+
+		// Attempt #2 starts at t=1.1s. Halfway through it the state must still read
+		// retrying: the attempt has not outlived connectGrace, so it has not earned
+		// "running". Recording it up front is what made the badge flap.
+		time.Sleep(950 * time.Millisecond)
+		synctest.Wait()
+		if mid, _ := health.Get(app.ID); mid.State != StreamStateRetrying {
+			t.Fatalf("state mid-retry = %q, want %q", mid.State, StreamStateRetrying)
+		}
+
+		// After many retries the timestamp still marks when the state began, which
+		// is what the Channels UI renders as "how long has this been broken".
+		time.Sleep(20 * time.Second)
+		synctest.Wait()
+		if n := attempts.Load(); n < 3 {
+			t.Fatalf("attempts = %d, want >= 3 (test did not exercise several retries)", n)
+		}
+		after, _ := health.Get(app.ID)
+		if after.State != StreamStateRetrying {
+			t.Fatalf("state after retries = %q, want %q", after.State, StreamStateRetrying)
+		}
+		if !after.UpdatedAt.Equal(failed.UpdatedAt) {
+			t.Fatalf("updated_at moved from %v to %v across retries; it must mark when the state changed", failed.UpdatedAt, after.UpdatedAt)
+		}
+	})
+}
+
+// The other half of the contract: an attempt that outlives connectGrace is what
+// "running" is supposed to mean, otherwise a healthy client would be stuck on
+// retrying forever.
+func TestStreamSupervisor_WhenAttemptOutlivesConnectGrace_RecordsRunning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		health := NewStreamHealthStore()
+		app := &model.ImApp{ID: 1, Provider: "test", AppID: "app"}
+		s := NewStreamSupervisor(streamRepoFunc(func(context.Context) ([]*model.ImApp, error) {
+			return []*model.ImApp{app}, nil
+		}), nil, health, discardLogger())
+		s.RegisterFactory("test", func(*model.ImApp, *Bridge) (StreamClient, error) {
+			return streamClientFunc(func(ctx context.Context) error {
+				select {
+				case <-time.After(30 * time.Second):
+					return errors.New("idle timeout")
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { cancel(); s.shutdown() }()
+
+		s.reconcileOnce(ctx)
+		synctest.Wait()
+
+		// Still inside the attempt, past connectGrace (5s but well before 30s).
+		time.Sleep(6 * time.Second)
+		synctest.Wait()
+
+		got, ok := health.Get(app.ID)
+		if !ok {
+			t.Fatal("no health recorded")
+		}
+		if got.State != StreamStateRunning {
+			t.Fatalf("state = %q, want %q: an attempt that outlived connectGrace is the closest thing to connected we can observe", got.State, StreamStateRunning)
+		}
+	})
+}
+
+// A panicking client unwinds past the join, so the grace timer armed for that
+// attempt is still running when the recover branch reports retrying and drops the
+// slot. It must not resurrect "running" for an app the supervisor no longer owns:
+// the slot is gone and no client exists.
+func TestStreamSupervisor_WhenClientPanics_GraceTimerDoesNotResurrectRunning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		health := NewStreamHealthStore()
+		app := &model.ImApp{ID: 1, Provider: "test", AppID: "app"}
+		s := NewStreamSupervisor(streamRepoFunc(func(context.Context) ([]*model.ImApp, error) {
+			return []*model.ImApp{app}, nil
+		}), nil, health, discardLogger())
+		s.RegisterFactory("test", func(*model.ImApp, *Bridge) (StreamClient, error) {
+			return streamClientFunc(func(context.Context) error {
+				panic("provider client exploded")
+			}), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer func() { cancel(); s.shutdown() }()
+
+		s.reconcileOnce(ctx)
+		synctest.Wait()
+
+		got, ok := health.Get(app.ID)
+		if !ok {
+			t.Fatal("no health recorded")
+		}
+		if got.State != StreamStateRetrying {
+			t.Fatalf("state after the panic = %q, want %q", got.State, StreamStateRetrying)
+		}
+
+		// Well past connectGrace: the abandoned timer must not claim the app back.
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if after, _ := health.Get(app.ID); after.State != StreamStateRetrying {
+			t.Fatalf("state = %q after the grace window, want %q: a dropped slot must not come back as running", after.State, StreamStateRetrying)
 		}
 	})
 }
