@@ -449,6 +449,7 @@ func TestStreamSupervisor_WhenStaleClientPanicsAfterReplacement_KeepsReplacement
 		s.reconcileOnce(ctx)
 		<-oldStarted
 		synctest.Wait()
+		oldSlot := s.running[old.ID] // captured before the rotation replaces it
 
 		apps = []*model.ImApp{next}
 		s.reconcileOnce(ctx)
@@ -460,6 +461,9 @@ func TestStreamSupervisor_WhenStaleClientPanicsAfterReplacement_KeepsReplacement
 		}
 
 		close(panicNow)
+		// Waiting on the old slot proves the panic actually fired. Without this
+		// the assertions below would also pass if the stale client never ran.
+		<-oldSlot.done
 		synctest.Wait()
 
 		got, ok := health.Get(next.ID)

@@ -201,10 +201,14 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 	// as running while no client exists.
 	defer func() {
 		if r := recover(); r != nil {
+			// Redact once, reuse twice: the panic value can carry a credential
+			// (providers embed request URLs in their errors), and this text ends
+			// up in the log as well as in the user-visible LastError.
+			reason := redactSensitive(fmt.Sprintf("panic: %v", r), slot.app)
 			s.log.Error("stream client panic",
 				slog.String("provider", client.ProviderName()),
 				slog.Uint64("im_app_id", slot.app.ID),
-				slog.Any("panic", r))
+				slog.String("panic", reason))
 			// Record the panic and drop the slot only if this goroutine still
 			// owns the app. After a credential rotation a stale client can
 			// panic *after* its replacement has started (the SDK exceeds the
@@ -218,7 +222,7 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 			if s.running[slot.app.ID] == slot {
 				s.health.Record(slot.app.ID, StreamHealth{
 					State:     StreamStateRetrying,
-					LastError: redactSensitive(fmt.Sprintf("panic: %v", r), slot.app),
+					LastError: reason,
 				})
 				delete(s.running, slot.app.ID)
 			}
@@ -232,15 +236,17 @@ func (s *StreamSupervisor) runClientWithRestart(ctx context.Context, slot *strea
 		// the long connection is established — see StreamStateRunning.
 		s.health.Record(slot.app.ID, StreamHealth{State: StreamStateRunning})
 		if err := client.Run(ctx); err != nil && ctx.Err() == nil {
+			// Same text feeds LastError and the log, so redact once.
+			safeErr := redactSensitive(err.Error(), slot.app)
 			s.health.Record(slot.app.ID, StreamHealth{
 				State:     StreamStateRetrying,
-				LastError: redactSensitive(err.Error(), slot.app),
+				LastError: safeErr,
 			})
 			s.log.Warn("stream client exited; reconnect",
 				slog.String("provider", client.ProviderName()),
 				slog.Uint64("im_app_id", slot.app.ID),
 				slog.Duration("backoff", backoff),
-				slog.Any("err", err))
+				slog.String("err", safeErr))
 		}
 		if ctx.Err() != nil {
 			return
