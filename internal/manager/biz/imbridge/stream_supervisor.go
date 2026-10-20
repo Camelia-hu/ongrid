@@ -286,9 +286,23 @@ func (s *StreamSupervisor) stopClients(ctx context.Context, slots map[uint64]*st
 		select {
 		case <-slot.done:
 		case <-stopCtx.Done():
-			s.log.Warn("stream client did not stop",
+			// The client ignored cancellation past the deadline. Go cannot kill a
+			// goroutine, so reconcile abandons this one on purpose: a leaked
+			// goroutine is better than a dead reconcile loop (issue #517). The
+			// consequences are spelled out in the log because they are invisible
+			// anywhere else — this path is the only evidence that a provider
+			// client is not honouring its context.
+			provider := ""
+			if slot.app != nil {
+				provider = slot.app.Provider
+			}
+			s.log.Warn("stream client did not stop within the stop timeout; abandoning it",
 				slog.Uint64("im_app_id", id),
-				slog.Any("err", stopCtx.Err()))
+				slog.String("provider", provider),
+				slog.Duration("timeout", streamStopTimeout),
+				slog.Any("err", stopCtx.Err()),
+				slog.String("impact", "the goroutine and its connection are leaked until the manager restarts; a replacement is started in the same reconcile pass, so the old client can briefly run alongside it - duplicate events are possible (the bridge dedups them, it does not prevent them) and poll-based providers such as Telegram getUpdates reject the new poller while the old one still polls; a repeating message here means the provider client is not honouring context cancellation and needs fixing at the source"),
+			)
 		}
 	}
 }
